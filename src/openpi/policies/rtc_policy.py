@@ -10,11 +10,12 @@ Key features:
 - Boundary consistency metrics
 """
 
+import copy
 import dataclasses
+import numbers
 from typing import Any, Dict, Optional
 import numpy as np
 import logging
-from collections import deque
 
 logger = logging.getLogger("openpi")
 
@@ -40,6 +41,18 @@ class RTCConfig:
 
     # Whether to track temporal metrics
     track_metrics: bool = True
+
+    def __post_init__(self) -> None:
+        if isinstance(self.overlap_size, bool) or not isinstance(self.overlap_size, numbers.Integral):
+            raise ValueError("overlap_size must be an integer")
+        if isinstance(self.replan_interval, bool) or not isinstance(self.replan_interval, numbers.Integral):
+            raise ValueError("replan_interval must be an integer")
+        if self.overlap_size < 0:
+            raise ValueError("overlap_size must be non-negative")
+        if self.replan_interval <= 0:
+            raise ValueError("replan_interval must be positive")
+        if self.blending_method not in {"none", "linear", "cosine"}:
+            raise ValueError(f"Unknown blending method: {self.blending_method}")
 
 
 class RTCPolicy:
@@ -68,6 +81,7 @@ class RTCPolicy:
         self.prev_chunk_tail = None
         self.step_in_chunk = 0
         self.total_steps = 0
+        self._action_dim = None
 
         # Metrics tracking
         self.metrics = {
@@ -86,6 +100,7 @@ class RTCPolicy:
         self.prev_chunk_tail = None
         self.step_in_chunk = 0
         self.total_steps = 0
+        self._action_dim = None
 
         if self.config.track_metrics:
             self.metrics = {
@@ -114,17 +129,49 @@ class RTCPolicy:
         if need_new_chunk:
             # Get new chunk from base policy
             result = self.base_policy.infer(observation)
-            new_chunk = result['actions']  # Shape: [H, A]
+            raw_chunk = np.asarray(result['actions'])
+            if raw_chunk.ndim != 2:
+                raise ValueError("policy must output actions with shape [H, D]")
+            if raw_chunk.shape[1] <= 0:
+                raise ValueError("policy action dimension must be positive")
+            if self._action_dim is not None and raw_chunk.shape[1] != self._action_dim:
+                raise ValueError(
+                    f"policy action dimension changed from {self._action_dim} to {raw_chunk.shape[1]}"
+                )
+            if not np.issubdtype(raw_chunk.dtype, np.number) or np.issubdtype(
+                raw_chunk.dtype, np.complexfloating
+            ):
+                raise ValueError("policy actions must have a real numeric dtype")
+
+            required_horizon = self.config.replan_interval + self.config.overlap_size
+            if len(raw_chunk) < required_horizon:
+                raise ValueError(
+                    "policy action horizon must be at least "
+                    "replan_interval + overlap_size "
+                    f"({required_horizon}), got {len(raw_chunk)}"
+                )
+
+            # Never mutate an array owned by the wrapped policy. Promote integer
+            # actions so fractional interpolation cannot be truncated on assignment.
+            if np.issubdtype(raw_chunk.dtype, np.floating):
+                raw_chunk = raw_chunk.copy()
+            else:
+                raw_chunk = raw_chunk.astype(np.float64)
+            if not np.all(np.isfinite(raw_chunk)):
+                raise ValueError("policy actions must contain only finite values")
+            self._action_dim = raw_chunk.shape[1]
+            new_chunk = raw_chunk.copy()
 
             # Store for metrics
             if self.config.track_metrics:
-                self.metrics['chunk_history'].append(new_chunk.copy())
+                self.metrics['chunk_history'].append(raw_chunk.copy())
 
             # Blend with previous chunk if we have overlap
             if self.prev_chunk_tail is not None and self.config.overlap_size > 0:
+                raw_new_head = raw_chunk[:self.config.overlap_size].copy()
                 blended_chunk = self._blend_chunks(
                     self.prev_chunk_tail,
-                    new_chunk[:self.config.overlap_size]
+                    raw_new_head,
                 )
                 # Replace the head of new chunk with blended version
                 new_chunk[:self.config.overlap_size] = blended_chunk
@@ -133,23 +180,27 @@ class RTCPolicy:
                 if self.config.track_metrics:
                     consistency = self._compute_boundary_consistency(
                         self.prev_chunk_tail,
-                        new_chunk[:self.config.overlap_size]
+                        raw_new_head,
                     )
                     self.metrics['boundary_consistency'].append(consistency)
                     self.metrics['chunk_transitions'].append({
                         'step': self.total_steps,
                         'prev_tail': self.prev_chunk_tail.copy(),
-                        'new_head': new_chunk[:self.config.overlap_size].copy(),
-                        'blended': blended_chunk.copy()
+                        'new_head': raw_new_head,
+                        'blended': blended_chunk.copy(),
                     })
 
             # Update state
             self.current_chunk = new_chunk
             self.step_in_chunk = 0
 
-            # Store tail for next blending
-            if len(new_chunk) >= self.config.overlap_size:
-                self.prev_chunk_tail = new_chunk[-self.config.overlap_size:].copy()
+            # Store predictions aligned immediately after the execution stride.
+            if self.config.overlap_size > 0:
+                tail_start = self.config.replan_interval
+                tail_end = tail_start + self.config.overlap_size
+                self.prev_chunk_tail = raw_chunk[tail_start:tail_end].copy()
+            else:
+                self.prev_chunk_tail = None
 
         # Get current action from chunk
         action = self.current_chunk[self.step_in_chunk]
@@ -181,7 +232,12 @@ class RTCPolicy:
             # No blending, just use new chunk
             return new_head
 
-        elif self.config.blending_method == 'linear':
+        if O == 1:
+            # With no interpolation interval, keep the prior aligned prediction
+            # at the seam to avoid introducing a one-step discontinuity.
+            return prev_tail.copy()
+
+        if self.config.blending_method == 'linear':
             # Linear interpolation: weight increases linearly from 0 to 1
             weights = np.linspace(0, 1, O)[:, None]  # Shape: [O, 1]
             blended = (1 - weights) * prev_tail + weights * new_head
@@ -206,8 +262,8 @@ class RTCPolicy:
         """
         Compute boundary consistency metric (Bjump from paper).
 
-        Measures the L2 distance between the last action of previous chunk
-        and first action of new chunk (before blending).
+        Measures the mean L2 discrepancy between predictions for the same
+        absolute timesteps in the previous tail and raw new head.
 
         Args:
             prev_tail: Tail of previous chunk, shape [O, A]
@@ -216,9 +272,12 @@ class RTCPolicy:
         Returns:
             Boundary jump magnitude
         """
-        # Compare last action of prev with first action of new
-        jump = np.linalg.norm(prev_tail[-1] - new_head[0])
-        return float(jump)
+        if prev_tail.shape != new_head.shape:
+            raise ValueError("prev_tail and new_head must have matching shape [O, D]")
+        if len(prev_tail) == 0:
+            return 0.0
+        difference = prev_tail.astype(np.float64) - new_head.astype(np.float64)
+        return float(np.mean(np.linalg.norm(difference, axis=1)))
 
     def get_metrics(self) -> Dict[str, Any]:
         """
@@ -234,7 +293,7 @@ class RTCPolicy:
         if not self.config.track_metrics:
             return {}
 
-        metrics = self.metrics.copy()
+        metrics = copy.deepcopy(self.metrics)
 
         # Compute temporal smoothness metrics if we have action history
         if len(self.metrics['action_history']) > 0:
