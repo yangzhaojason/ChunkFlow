@@ -174,3 +174,21 @@ def test_single_step_overlap_prefers_previous_aligned_prediction():
     outputs = [policy.infer({})["actions"] for _ in range(3)]
 
     np.testing.assert_allclose(outputs, [[0], [1], [2]])
+
+
+def test_action_transform_runs_after_blending_before_metrics():
+    policy = RTCPolicy(
+        FakePolicy(
+            [
+                np.ones((5, 1), dtype=np.float32),
+                -np.ones((5, 1), dtype=np.float32),
+            ]
+        ),
+        RTCConfig(replan_interval=2, overlap_size=3, blending_method="linear"),
+        action_transform=lambda action: np.where(action > 0.0, 1.0, -1.0),
+    )
+
+    outputs = [policy.infer({})["actions"] for _ in range(4)]
+
+    np.testing.assert_array_equal(outputs, [[1.0], [1.0], [1.0], [-1.0]])
+    np.testing.assert_array_equal(policy.get_metrics()["action_history"], outputs)

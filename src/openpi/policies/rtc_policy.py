@@ -11,6 +11,7 @@ Key features:
 """
 
 import copy
+from collections.abc import Callable
 import dataclasses
 import numbers
 from typing import Any, Dict, Optional
@@ -65,16 +66,27 @@ class RTCPolicy:
     - Metric tracking for evaluation
     """
 
-    def __init__(self, base_policy, config: RTCConfig):
+    def __init__(
+        self,
+        base_policy,
+        config: RTCConfig,
+        *,
+        action_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+    ):
         """
         Initialize RTC policy wrapper.
 
         Args:
             base_policy: Base policy that generates action chunks
             config: RTC configuration
+            action_transform: Optional projection applied after overlap blending
+                and before the action is recorded or returned.
         """
+        if action_transform is not None and not callable(action_transform):
+            raise TypeError("action_transform must be callable")
         self.base_policy = base_policy
         self.config = config
+        self._action_transform = action_transform
 
         # State for RTC execution
         self.current_chunk = None
@@ -203,7 +215,18 @@ class RTCPolicy:
                 self.prev_chunk_tail = None
 
         # Get current action from chunk
-        action = self.current_chunk[self.step_in_chunk]
+        action = self.current_chunk[self.step_in_chunk].copy()
+        if self._action_transform is not None:
+            transformed = np.asarray(self._action_transform(action.copy()))
+            if transformed.shape != action.shape:
+                raise ValueError("action_transform must preserve action shape [D]")
+            if not np.issubdtype(transformed.dtype, np.number) or np.issubdtype(
+                transformed.dtype, np.complexfloating
+            ):
+                raise ValueError("action_transform must return real numeric actions")
+            if not np.all(np.isfinite(transformed)):
+                raise ValueError("action_transform must return only finite actions")
+            action = transformed.copy()
 
         # Track action history
         if self.config.track_metrics:
