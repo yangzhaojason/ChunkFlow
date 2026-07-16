@@ -1,0 +1,37 @@
+# Run with:
+# docker pull docker.1ms.run/nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+# docker compose -f scripts/docker/compose.yml up --build
+services:
+  openpi_server:
+    container_name: chunkflow_openpi_server
+    image: openpi:v2.0
+    build:
+      context: ../..
+      dockerfile: scripts/docker/serve_policy.Dockerfile
+    init: true
+    tty: true
+    network_mode: host
+    gpus: all
+    # Populate configured openpi data home to /openpi_assets inside the container.
+    # Populate aws credential inside the container.
+    shm_size: 8gb
+    mem_limit: 1024g
+    volumes:
+      - ${CHUNKFLOW_SOURCE_DIR:-../..}:/app
+      - ${OPENPI_DATA_HOME:-${HOME}/.cache/openpi}:/openpi_assets
+      - ${CHUNKFLOW_DATA_DIR:-../../datasets}:/app/datasets:rw
+      - ${CHUNKFLOW_CHECKPOINT_DIR:-../../checkpoints}:/app/checkpoints:rw
+      - ${CHUNKFLOW_OUTPUT_DIR:-../../outputs}:/app/outputs:rw
+    environment:
+      - SERVER_ARGS
+      - OPENPI_DATA_HOME=/openpi_assets
+      - IS_DOCKER=true
+
+    # Comment out this block if not running on a machine with GPUs.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 8
+    #           capabilities: [gpu]
