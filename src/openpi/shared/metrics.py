@@ -1,5 +1,53 @@
+import math
+import numbers
 import numpy as np
 from typing import List, Tuple, Dict, Any
+
+
+def _as_action_matrix(actions, *, name: str = "actions") -> np.ndarray:
+    """Validate and convert an action sequence to finite float64 [T, D]."""
+    try:
+        array = np.asarray(actions)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a real numeric matrix [T, D]") from None
+    if array.ndim != 2:
+        raise ValueError(f"{name} must have shape [T, D]")
+    if array.shape[1] <= 0:
+        raise ValueError(f"{name} action dimension must be positive")
+    if not np.issubdtype(array.dtype, np.number) or np.issubdtype(
+        array.dtype, np.complexfloating
+    ):
+        raise ValueError(f"{name} must contain real numeric actions")
+    array = array.astype(np.float64, copy=False)
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite actions")
+    return array
+
+
+def _row_lp_norm(values: np.ndarray, p: float) -> np.ndarray:
+    """Compute row-wise Lp norms without avoidable square under/overflow."""
+    absolute = np.abs(values)
+    scale = np.max(absolute, axis=1)
+    normalized = np.divide(
+        absolute,
+        scale[:, None],
+        out=np.zeros_like(absolute),
+        where=scale[:, None] != 0.0,
+    )
+    factor = np.sum(normalized**p, axis=1) ** (1.0 / p)
+    return scale * factor
+
+
+def _stable_nonnegative_mean(values: np.ndarray) -> float:
+    """Average non-negative values without overflowing an intermediate sum."""
+    if values.size == 0:
+        return 0.0
+    scale = float(np.max(values))
+    if scale == 0.0:
+        return 0.0
+    if not math.isfinite(scale):
+        return scale
+    return float(scale * np.mean(values / scale))
 
 
 def compute_msd_delta(actions: np.ndarray, order: int = 1) -> float:
@@ -8,12 +56,11 @@ def compute_msd_delta(actions: np.ndarray, order: int = 1) -> float:
     actions: [T, D]
     order: 1, 2, or 3 (Δa, Δ^2 a, Δ^3 a)
     """
-    if actions.ndim != 2:
-        raise ValueError("actions must be [T, D]")
+    actions = _as_action_matrix(actions)
     if order not in (1, 2, 3):
         raise ValueError("order must be 1, 2, or 3")
 
-    diffs = actions.astype(np.float64)
+    diffs = actions
     for _ in range(order):
         diffs = np.diff(diffs, axis=0)
     if diffs.shape[0] == 0:
@@ -27,11 +74,10 @@ def compute_tv_l1(actions: np.ndarray) -> float:
     Total Variation (TV-L1): sum of L1 differences across consecutive time steps, normalized by T-1.
     actions: [T, D]
     """
-    if actions.ndim != 2:
-        raise ValueError("actions must be [T, D]")
+    actions = _as_action_matrix(actions)
     if actions.shape[0] < 2:
         return 0.0
-    diffs = np.abs(np.diff(actions.astype(np.float64), axis=0))
+    diffs = np.abs(np.diff(actions, axis=0))
     return float(np.mean(np.sum(diffs, axis=1)))
 
 
@@ -48,18 +94,22 @@ def compute_hf_ratio(
       - Uses rFFT over time axis for each dimension, averages energy across dims.
       - Excludes DC component (k=0) from the denominator and numerator.
     """
-    if actions.ndim != 2:
-        raise ValueError("actions must be [T, D]")
+    if not np.isfinite(cutoff_ratio) or not 0.0 <= cutoff_ratio <= 1.0:
+        raise ValueError("cutoff_ratio must be finite and within [0, 1]")
+    actions = _as_action_matrix(actions)
     T = actions.shape[0]
     if T < 3:
         return 0.0
-    x = actions.astype(np.float64)
+    x = actions
+    scale = float(np.max(np.abs(x)))
+    if scale == 0.0:
+        return 0.0
+    x = x / scale
     # rFFT over time; shape -> [F, D], F = T//2 + 1
     X = np.fft.rfft(x, axis=0)
     # Frequency bins normalized to [0, 1] (Nyquist at 1.0)
     freqs = np.fft.rfftfreq(T, d=1.0)  # d=1 time unit per step
-    nyquist = freqs[-1] if freqs[-1] > 0 else 1.0
-    norm_freqs = freqs / nyquist
+    norm_freqs = freqs / 0.5
 
     # Exclude DC (k=0)
     X_mag2 = np.abs(X[1:, :]) ** 2
@@ -69,10 +119,47 @@ def compute_hf_ratio(
 
     high_mask = nf >= cutoff_ratio
     num = np.sum(X_mag2[high_mask, :])
-    den = np.sum(X_mag2)
-    if den <= 1e-12:
+    den = float(np.sum(X_mag2))
+    if den == 0.0:
         return 0.0
     return float(num / den)
+
+
+def compute_average_reasoning_latency(
+    chunk_latencies,
+    executed_action_counts,
+) -> float:
+    """Return total chunk inference time per executed action."""
+    try:
+        latencies = np.asarray(chunk_latencies, dtype=object)
+        counts = np.asarray(executed_action_counts, dtype=object)
+    except (TypeError, ValueError):
+        raise ValueError("latencies and action counts must be equal-length vectors") from None
+    if latencies.ndim != 1 or counts.ndim != 1 or counts.shape != latencies.shape:
+        raise ValueError("latencies and action counts must be equal-length vectors")
+
+    latency_values = []
+    for value in latencies.tolist():
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+            raise ValueError("chunk latencies must be real numbers")
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("chunk latencies must be finite and non-negative")
+        latency_values.append(value)
+
+    count_values = []
+    for value in counts.tolist():
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
+            raise ValueError("executed action counts must be integers")
+        value = int(value)
+        if value < 0:
+            raise ValueError("executed action counts must be non-negative")
+        count_values.append(value)
+
+    total_actions = sum(count_values)
+    if total_actions <= 0:
+        raise ValueError("total executed action count must be positive")
+    return float(math.fsum(latency_values) / total_actions)
 
 
 def compute_seam_metrics(
@@ -88,36 +175,30 @@ def compute_seam_metrics(
       - bjump: average absolute seam discrepancy across overlap (L2 by default)
       - bratio: seam discrepancy normalized by average intra-chunk L2 step change
     """
+    previous_tail = _as_action_matrix(previous_tail, name="previous_tail")
+    new_head = _as_action_matrix(new_head, name="new_head")
     if previous_tail.shape != new_head.shape:
         raise ValueError("previous_tail and new_head must have the same shape [O, D]")
+    if isinstance(p, bool) or not isinstance(p, numbers.Real) or not math.isfinite(p) or p <= 0:
+        raise ValueError("p must be a finite positive norm order")
     O = previous_tail.shape[0]
     if O == 0:
         return {"bjump": 0.0, "bratio": 0.0}
 
-    diff = previous_tail.astype(np.float64) - new_head.astype(np.float64)
-    if p == 2:
-        bjump = float(np.mean(np.linalg.norm(diff, axis=1)))
-    elif p == 1:
-        bjump = float(np.mean(np.sum(np.abs(diff), axis=1)))
-    else:
-        # Generic Lp using powered mean
-        bjump = float(np.mean(np.sum(np.abs(diff) ** p, axis=1) ** (1.0 / p)))
+    diff = previous_tail - new_head
+    bjump = _stable_nonnegative_mean(_row_lp_norm(diff, p))
 
     # Reference scale: average intra-chunk L2 step change of the new head region
     if O >= 2:
-        intra = np.diff(new_head.astype(np.float64), axis=0)
-        if p == 2:
-            denom = float(np.mean(np.linalg.norm(intra, axis=1)))
-        elif p == 1:
-            denom = float(np.mean(np.sum(np.abs(intra), axis=1)))
-        else:
-            denom = float(np.mean(np.sum(np.abs(intra) ** p, axis=1) ** (1.0 / p)))
-        if denom < 1e-12:
-            bratio = 0.0
-        else:
-            bratio = bjump / denom
+        intra = np.diff(new_head, axis=0)
+        denom = _stable_nonnegative_mean(_row_lp_norm(intra, p))
     else:
-        bratio = 0.0
+        denom = 0.0
+
+    if denom == 0.0:
+        bratio = 0.0 if bjump == 0.0 else float("inf")
+    else:
+        bratio = bjump / denom
 
     return {"bjump": bjump, "bratio": bratio}
 

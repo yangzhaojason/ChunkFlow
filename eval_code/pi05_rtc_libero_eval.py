@@ -45,6 +45,7 @@ import seaborn as sns
 import torch
 
 from openpi.policies.rtc_policy import RTCPolicy, RTCConfig, RTCPolicyWrapper
+from openpi.shared import metrics as _metrics
 
 # Fix PyTorch 2.6+ torch.load weights_only issue for LIBERO init_states
 # Add all common numpy types to safe globals
@@ -124,7 +125,7 @@ class Args:
     save_pred_actions: bool = True  # Save per-episode predicted actions (NPZ)
     save_plots: bool = True  # Save plots
     detailed_logging: bool = True  # Detailed logging
-    fc_ratio: float = 0.25  # High-frequency cutoff ratio (0..0.5), aligns with eval_action_smoothness
+    fc_ratio: float = 0.25  # High-frequency cutoff ratio normalized to Nyquist (0..1)
 
     # Ablation study
     run_ablation: bool = False  # Run ablation study
@@ -158,25 +159,17 @@ class TemporalMetrics:
         if len(chunk_transitions) == 0:
             return {'bjump': 0.0, 'bratio': 0.0}
 
-        # Compute bjump and per-boundary bratio baseline using intra-step magnitude
+        # Compute aligned overlap metrics with the canonical paper definition.
         boundary_jumps = []
         boundary_ratios = []
         for trans in chunk_transitions:
-            prev_tail = np.asarray(trans.get('prev_tail', []), dtype=np.float32)
-            new_head = np.asarray(trans.get('new_head', []), dtype=np.float32)
+            prev_tail = np.asarray(trans.get('prev_tail', []))
+            new_head = np.asarray(trans.get('new_head', []))
             if prev_tail.size == 0 or new_head.size == 0:
                 continue
-            # Jump between last of prev and first of new (before blending)
-            jump = float(np.linalg.norm(prev_tail[-1] - new_head[0]))
-            boundary_jumps.append(jump)
-            # Intra-step baseline: mean per-step speed within prev_tail
-            if prev_tail.shape[0] >= 2:
-                d1 = np.diff(prev_tail, n=1, axis=0)
-                step_speeds = np.sqrt((d1 ** 2).sum(axis=-1))
-                intra_mean = float(step_speeds.mean() + 1e-8)
-            else:
-                intra_mean = 1.0
-            boundary_ratios.append(jump / intra_mean)
+            seam = _metrics.compute_seam_metrics(prev_tail, new_head)
+            boundary_jumps.append(seam['bjump'])
+            boundary_ratios.append(seam['bratio'])
 
         bjump = float(np.mean(boundary_jumps)) if boundary_jumps else 0.0
         bratio = float(np.mean(boundary_ratios)) if boundary_ratios else 0.0
@@ -197,34 +190,19 @@ class TemporalMetrics:
 
         Args:
             action_history: Full action sequence [T, A]
-            fc_ratio: Cutoff ratio of Nyquist (0..0.5). Aligns with eval_action_smoothness
+            fc_ratio: Cutoff ratio normalized to Nyquist in [0, 1]
 
         Returns:
             Dict with hf_ratio and related metrics
         """
-        if len(action_history) < 10:
-            return {'hf_ratio': 0.0}
-
-        # Subtract mean per-dim, use rfft and power spectrum like eval_action_smoothness
-        X = action_history - action_history.mean(axis=0, keepdims=True)
-        F = np.fft.rfft(X, axis=0)
-        P = (F * np.conj(F)).real  # Power spectrum
-        K = P.shape[0]
-        cutoff = max(1, int((K - 1) * fc_ratio))
-        high = float(P[cutoff:, :].sum())
-        total = float(P.sum() + 1e-8)
-        hf_ratio_val = high / total if total > 0 else 0.0
-
-        return {
-            'hf_ratio': float(hf_ratio_val),
-        }
+        return {'hf_ratio': _metrics.compute_hf_ratio(action_history, cutoff_ratio=fc_ratio)}
 
     @staticmethod
     def compute_global_variation(action_history: np.ndarray) -> Dict[str, float]:
         """
         Compute global variation metrics.
 
-        tv_l1: Mean absolute of first differences (aligns with eval_action_smoothness)
+        tv_l1: Mean per-step L1 norm of first differences
         msd_d1: Mean squared displacement of first differences
         msd_d2: Mean squared displacement of second differences
         msd_d3: Mean squared displacement of third differences
@@ -235,31 +213,11 @@ class TemporalMetrics:
         Returns:
             Dict with variation metrics
         """
-        if len(action_history) < 2:
-            return {'tv_l1': 0.0, 'msd_d1': 0.0, 'msd_d2': 0.0, 'msd_d3': 0.0}
-
-        # First, second, third differences
-        diffs = action_history[1:] - action_history[:-1]
-        d1 = diffs
-        d2 = np.diff(action_history, n=2, axis=0) if action_history.shape[0] >= 3 else np.zeros((0, action_history.shape[1]), dtype=action_history.dtype)
-        d3 = np.diff(action_history, n=3, axis=0) if action_history.shape[0] >= 4 else np.zeros((0, action_history.shape[1]), dtype=action_history.dtype)
-
-        # tv_l1 as mean absolute of first differences
-        tv_l1 = float(np.abs(d1).mean())
-
-        def l2_mean(x: np.ndarray) -> float:
-            if x.shape[0] == 0:
-                return 0.0
-            return float((x ** 2).sum(axis=-1).mean())
-        msd_1 = l2_mean(d1)
-        msd_2 = l2_mean(d2)
-        msd_3 = l2_mean(d3)
-
         return {
-            'tv_l1': float(tv_l1),
-            'msd_d1': float(msd_1),
-            'msd_d2': float(msd_2),
-            'msd_d3': float(msd_3),
+            'tv_l1': _metrics.compute_tv_l1(action_history),
+            'msd_d1': _metrics.compute_msd_delta(action_history, order=1),
+            'msd_d2': _metrics.compute_msd_delta(action_history, order=2),
+            'msd_d3': _metrics.compute_msd_delta(action_history, order=3),
         }
 
 
@@ -464,23 +422,19 @@ class Pi05RTCEvaluator:
                 inference_time = (time.time() - inference_start) * 1000
                 inference_times.append(inference_time)
 
-                # Track for ARL: detect when a new chunk is generated
+                # Track for ARL: detect when a new chunk is generated.
                 # RTC policy replans every replan_interval steps
                 if (len(actions_taken) % self.args.replan_interval) == 0:
-                    # New chunk generated
                     if chunk_count > 0:
-                        # Save previous chunk's contribution
                         chunk_action_counts.append(actions_from_current_chunk)
                     chunk_inference_times.append(inference_time)
                     chunk_count += 1
-                    actions_from_current_chunk = 1
-                else:
-                    actions_from_current_chunk += 1
-
-                actions_taken.append(action.copy())
+                    actions_from_current_chunk = 0
 
                 # Execute action
                 obs, reward, done, info = env.step(action.tolist())
+                actions_taken.append(action.copy())
+                actions_from_current_chunk += 1
 
                 if done:
                     success = True
@@ -495,21 +449,20 @@ class Pi05RTCEvaluator:
         episode_duration = time.time() - episode_start_time
 
         # Finalize ARL tracking: add last chunk's contribution
-        if chunk_count > 0 and actions_from_current_chunk > 0:
+        if chunk_count > 0:
             chunk_action_counts.append(actions_from_current_chunk)
 
-        # Compute ARL (Average Reasoning Latency)
-        # ARL = (1/|A|) * sum_{c=1}^{K} (T_c / |a_c|)
-        # where T_c is inference time for chunk c, |a_c| is actions contributed by chunk c
+        # ARL is total chunk inference time divided by total executed actions.
         arl = 0.0
-        if len(chunk_inference_times) > 0 and len(chunk_action_counts) > 0:
-            total_actions = sum(chunk_action_counts)
-            if total_actions > 0:
-                # Sum of (T_c / |a_c|) for each chunk
-                weighted_sum = sum(
-                    t_c / a_c for t_c, a_c in zip(chunk_inference_times, chunk_action_counts) if a_c > 0
-                )
-                arl = weighted_sum / len(chunk_action_counts)  # Average over chunks
+        if (
+            len(chunk_inference_times) > 0
+            and len(chunk_action_counts) > 0
+            and sum(chunk_action_counts) > 0
+        ):
+            arl = _metrics.compute_average_reasoning_latency(
+                chunk_inference_times,
+                chunk_action_counts,
+            )
 
         # Get RTC metrics
         rtc_metrics = self.policy.get_metrics()
