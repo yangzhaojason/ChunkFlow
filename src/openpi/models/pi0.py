@@ -7,8 +7,11 @@
 - 两种模式：Pi0（状态连续、无 adaRMS）与 Pi05（状态离散进 token，动作专家用 adaRMS 条件）
 """
 
+from __future__ import annotations
+
 import logging
 import numbers
+from typing import NamedTuple
 
 import einops
 import flax.nnx as nnx
@@ -19,13 +22,29 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models.chunkflow_history import corrupt_history
+from openpi.models.chunkflow_history import scheduled_sampling_alpha
 from openpi.models.chunkflow_history import validate_history
+from openpi.models.chunkflow_losses import boundary_consistency_loss
+from openpi.models.chunkflow_losses import continuity_penalties
+from openpi.models.chunkflow_losses import flow_endpoint
+from openpi.models.chunkflow_objectives import combine_supervised_losses
+from openpi.models.chunkflow_objectives import coordinate_aligned_predicted_history
+from openpi.models.chunkflow_objectives import share_boundary_noise
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 # 项目日志记录器
 logger = logging.getLogger("openpi")
+
+
+class FlowForwardOutput(NamedTuple):
+    per_step_loss: jax.Array
+    velocity: jax.Array
+    x_t: jax.Array
+    time: jax.Array
+    endpoint: jax.Array
 
 
 def history_action_masks(
@@ -103,6 +122,13 @@ class Pi0(_model.BaseModel):
         # Pi05 开关：影响状态处理与 adaRMS 条件
         self.pi05 = config.pi05
         self.history_length = config.history_length
+        self.history_noise_std = config.history_noise_std
+        self.history_dropout_probability = config.history_dropout_probability
+        self.history_schedule_warmup_steps = config.history_schedule_warmup_steps
+        self.history_schedule_ramp_steps = config.history_schedule_ramp_steps
+        self.history_schedule_max_alpha = config.history_schedule_max_alpha
+        self.overlap_O = config.overlap_O
+        self.boundary_weight = config.boundary_weight
         # Continuity regularization weights (ChunkFlow-style, no-RL)
         self.continuity_first_order_weight = getattr(
             config, "continuity_first_order_weight", 0.0
@@ -280,68 +306,214 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
-    @override
-    def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
-        # 预处理观测；采样噪声与时间；构造 x_t 与监督目标 u_t
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(
-            preprocess_rng, observation, train=train)
-
-        batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        # 前缀+后缀 一次性前向
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(
-            observation)
+    def _predict_velocity(
+        self,
+        observation: _model.Observation,
+        x_t: _model.Actions,
+        time: jax.Array,
+    ) -> jax.Array:
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            observation, x_t, time)
+            observation, x_t, time
+        )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[
-                None, adarms_cond]
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
+        return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        # Base flow-matching loss per-position (reduce over action dims)
-        per_pos_mse = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [B, T]
+    def flow_forward(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool,
+        noise: jax.Array | None = None,
+        time: jax.Array | None = None,
+    ) -> FlowForwardOutput:
+        """Run one flow-matching forward and expose its endpoint estimate."""
 
-        # ChunkFlow continuity regularization (no-RL):
-        # We construct a proxy of predicted actions at the sampled time t as: a_hat = noise - v_t
-        # and apply first-order (TV-like) and second-order smoothness penalties over the time axis.
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        if actions.ndim != 3 or actions.shape[-2:] != (self.action_horizon, self.action_dim):
+            raise ValueError(
+                f"actions must have shape [B, {self.action_horizon}, {self.action_dim}], got {actions.shape}"
+            )
+
+        batch_shape = actions.shape[:-2]
+        if noise is None:
+            noise = jax.random.normal(noise_rng, actions.shape, dtype=actions.dtype)
+        elif noise.shape != actions.shape:
+            raise ValueError(f"noise shape {noise.shape} must match actions {actions.shape}")
+        if time is None:
+            time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        elif time.shape != batch_shape:
+            raise ValueError(f"time shape {time.shape} must match batch shape {batch_shape}")
+
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1.0 - time_expanded) * actions
+        target_velocity = noise - actions
+        velocity = self._predict_velocity(observation, x_t, time)
+        per_step_loss = jnp.mean(jnp.square(velocity - target_velocity), axis=-1)
+        endpoint = flow_endpoint(x_t, velocity, time)
+        return FlowForwardOutput(per_step_loss, velocity, x_t, time, endpoint)
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        output = self.flow_forward(rng, observation, actions, train=train)
+        per_pos_mse = output.per_step_loss
+
+        # ChunkFlow continuity regularization (no-RL): extrapolate the sampled
+        # flow field to its clean endpoint and regularize that action sequence.
         lam_tv = getattr(self, "continuity_first_order_weight", 0.0)
         lam_dd2 = getattr(self, "continuity_second_order_weight", 0.0)
 
         if lam_tv > 0.0 or lam_dd2 > 0.0:
-            a_hat = noise - v_t  # [B, T, A]
-
-            # First-order: mean L1 of temporal differences
-            tv_loss = 0.0
-            if lam_tv > 0.0:
-                d1 = a_hat[:, 1:, :] - a_hat[:, :-1, :]
-                tv_loss = jnp.mean(jnp.abs(d1), axis=(-1, -2))  # [B]
-
-            # Second-order: mean L2 of temporal second differences
-            dd2_loss = 0.0
-            if lam_dd2 > 0.0 and self.action_horizon >= 3:
-                d2 = a_hat[:, 2:, :] - 2 * a_hat[:, 1:-1, :] + a_hat[:, :-2, :]
-                dd2_loss = jnp.mean(jnp.square(d2), axis=(-1, -2))  # [B]
+            tv_loss, dd2_loss = continuity_penalties(output.endpoint)
 
             # Aggregate to per-sample scalar and return. Keep base per-position loss by averaging over time.
             base_per_sample = jnp.mean(per_pos_mse, axis=-1)  # [B]
-            total_per_sample = base_per_sample + lam_tv * tv_loss + lam_dd2 * dd2_loss
-            return total_per_sample
+            return base_per_sample + lam_tv * tv_loss + lam_dd2 * dd2_loss
 
         # Default: return per-position loss (keeps existing behavior)
         return per_pos_mse
+
+    def compute_paired_loss(
+        self,
+        rng: at.KeyArrayLike,
+        previous_observation: _model.Observation,
+        previous_actions: _model.Actions,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        ema_model: Pi0 | None,
+        step: int | jax.Array,
+        train: bool,
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
+        """Train on adjacent chunks with scheduled history and seam supervision."""
+
+        if previous_actions.shape != actions.shape or actions.ndim != 3:
+            raise ValueError("paired actions must share shape [B, L, A]")
+        if actions.shape[-2:] != (self.action_horizon, self.action_dim):
+            raise ValueError("paired actions do not match the configured horizon/action dimension")
+
+        (
+            previous_noise_rng,
+            current_noise_rng,
+            time_rng,
+            previous_forward_rng,
+            ema_forward_rng,
+            current_forward_rng,
+            history_rng,
+        ) = jax.random.split(rng, 7)
+        previous_noise = jax.random.normal(
+            previous_noise_rng, previous_actions.shape, dtype=previous_actions.dtype
+        )
+        current_noise = jax.random.normal(
+            current_noise_rng, actions.shape, dtype=actions.dtype
+        )
+        previous_noise = share_boundary_noise(
+            previous_noise,
+            current_noise,
+            overlap=self.overlap_O,
+        )
+        time = jax.random.beta(time_rng, 1.5, 1, actions.shape[:-2]) * 0.999 + 0.001
+
+        previous_output = None
+        if self.boundary_weight > 0:
+            previous_output = self.flow_forward(
+                previous_forward_rng,
+                previous_observation,
+                previous_actions,
+                train=train,
+                noise=previous_noise,
+                time=time,
+            )
+
+        alpha = jnp.zeros((), dtype=actions.dtype)
+        if self.history_length > 0:
+            if ema_model is None:
+                raise ValueError("EMA model is required when history conditioning is enabled")
+            if observation.action_history is None or observation.action_history_mask is None:
+                raise ValueError("current paired observation requires action_history and mask")
+            ema_previous = ema_model.flow_forward(
+                ema_forward_rng,
+                previous_observation,
+                previous_actions,
+                train=False,
+                noise=previous_noise,
+                time=time,
+            )
+            predicted_history = coordinate_aligned_predicted_history(
+                ema_previous.endpoint,
+                previous_actions,
+                observation.action_history,
+                stride=self.action_horizon - self.overlap_O,
+            )
+            alpha = scheduled_sampling_alpha(
+                step,
+                warmup_steps=self.history_schedule_warmup_steps,
+                ramp_steps=self.history_schedule_ramp_steps,
+                max_alpha=self.history_schedule_max_alpha,
+            )
+            mixed_history, history_mask = corrupt_history(
+                history_rng,
+                observation.action_history,
+                observation.action_history_mask,
+                predicted_history,
+                noise_std=self.history_noise_std,
+                dropout_probability=self.history_dropout_probability,
+                alpha=alpha,
+            )
+            observation = observation.replace(
+                action_history=mixed_history,
+                action_history_mask=history_mask,
+            )
+
+        current_output = self.flow_forward(
+            current_forward_rng,
+            observation,
+            actions,
+            train=train,
+            noise=current_noise,
+            time=time,
+        )
+        first_order, second_order = continuity_penalties(current_output.endpoint)
+        if self.boundary_weight > 0:
+            boundary = boundary_consistency_loss(
+                current_output.endpoint,
+                previous_output.endpoint,
+                overlap=self.overlap_O,
+                current_target=actions,
+                previous_target=previous_actions,
+            )
+        else:
+            boundary = jnp.zeros((), dtype=actions.dtype)
+
+        total, metrics = combine_supervised_losses(
+            current_output.per_step_loss,
+            first_order=first_order,
+            second_order=second_order,
+            boundary=boundary,
+            first_weight=self.continuity_first_order_weight,
+            second_weight=self.continuity_second_order_weight,
+            boundary_weight=self.boundary_weight,
+        )
+        metrics = {
+            **metrics,
+            "loss/total": total,
+            "history/alpha": alpha,
+        }
+        return total, metrics
 
     @override
     def sample_actions(
@@ -405,7 +577,7 @@ class Pi0(_model.BaseModel):
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
-            x_t, time = carry
+            _, time = carry
             # 对浮点误差鲁棒的终止条件
             return time >= -dt / 2
 

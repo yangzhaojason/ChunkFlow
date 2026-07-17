@@ -28,6 +28,8 @@ import wandb  # Weights & Biases 日志
 import openpi.models.model as _model  # 项目：模型基类与类型
 import openpi.shared.array_typing as at  # 项目：数组/类型别名
 import openpi.shared.nnx_utils as nnx_utils  # 项目：NNX 工具函数
+from openpi.training import chunkflow_batch as _chunkflow_batch
+from openpi.training import chunkflow_train as _chunkflow_train
 import openpi.training.checkpoints as _checkpoints  # 项目：checkpoint 管理
 import openpi.training.config as _config  # 项目：训练配置
 import openpi.training.data_loader as _data_loader  # 项目：数据加载器
@@ -189,28 +191,52 @@ def train_step(
     config: _config.TrainConfig,  # 训练配置
     rng: at.KeyArrayLike,  # 随机数键
     state: training_utils.TrainState,  # 当前训练状态
-    batch: tuple[_model.Observation, _model.Actions],  # 一个 batch 的观测与动作
+    batch: _data_loader.TrainingBatch,  # legacy 或 episode-paired batch
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:  # 返回新状态与指标字典
     """单步训练：前向计算损失，求梯度并应用更新，返回新状态与指标。"""
+    is_paired_batch = isinstance(batch, _chunkflow_batch.PairedChunkBatch)
+    chunkflow_enabled = bool(getattr(config.model, "chunkflow_supervised_enabled", False))
+    if chunkflow_enabled and not is_paired_batch:
+        raise ValueError("ChunkFlow supervision requires an episode-paired batch")
+    if is_paired_batch and not chunkflow_enabled:
+        raise ValueError("received a paired batch while ChunkFlow supervision is disabled")
+
     model = nnx.merge(state.model_def, state.params)  # 将图定义与参数合并为可训练模型
     model.train()  # 切换为训练模式（影响 Dropout/BN 等）
 
-    @at.typecheck  # 对内部损失函数进行类型检查
-    def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        # 模型计算分块损失（按 batch 维展开），再取均值
-        chunked_loss = model.compute_loss(
-            rng, observation, actions, train=True)  # 返回每样本或分块损失
-        return jnp.mean(chunked_loss)  # 聚合为标量
+    def loss_fn(model: _model.BaseModel, rng: at.KeyArrayLike, train_batch, ema_model):
+        if isinstance(train_batch, _chunkflow_batch.PairedChunkBatch):
+            return model.compute_paired_loss(
+                rng,
+                train_batch.previous_observation,
+                train_batch.previous_actions,
+                train_batch.observation,
+                train_batch.actions,
+                ema_model=ema_model,
+                step=train_batch.step,
+                train=True,
+            )
+        observation, actions = train_batch
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        return jnp.mean(chunked_loss), {}
 
     train_rng = jax.random.fold_in(rng, state.step)  # 将步数折叠进随机键，保证每步随机性
-    observation, actions = batch  # 解包 batch
+    batch = _chunkflow_train.batch_with_step(batch, state.step)
+    ema_model = None
+    if isinstance(batch, _chunkflow_batch.PairedChunkBatch):
+        if config.model.history_length > 0 and state.ema_params is None:
+            raise ValueError("ChunkFlow history conditioning requires TrainConfig.ema_decay")
+        if state.ema_params is not None:
+            ema_model = nnx.merge(state.model_def, state.ema_params)
+            ema_model.eval()
 
     # 仅对可训练参数求导与更新
     diff_state = nnx.DiffState(0, config.trainable_filter)  # 指定可微分参数子集
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
-        model, train_rng, observation, actions)  # 计算损失与梯度
+    (loss, loss_metrics), grads = nnx.value_and_grad(
+        loss_fn,
+        argnums=diff_state,
+        has_aux=True,
+    )(model, train_rng, batch, ema_model)
 
     params = state.params.filter(config.trainable_filter)  # 仅抽取可训练参数
     updates, new_opt_state = state.tx.update(
@@ -246,6 +272,7 @@ def train_step(
         "loss": loss,  # 损失
         "grad_norm": optax.global_norm(grads),  # 梯度全局范数
         "param_norm": optax.global_norm(kernel_params),  # 权重（kernel）全局范数
+        **loss_metrics,
     }
     return new_state, info  # 返回新状态与指标
 
@@ -292,17 +319,18 @@ def main(config: _config.TrainConfig):  # 主函数：训练入口
         f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")  # 打印 batch 信息
 
     # Log images from first batch to sanity check.
+    first_observation = _chunkflow_train.batch_observation(batch)
     images_to_log = [
         wandb.Image(np.concatenate([np.array(img[i])
-                    for img in batch[0].images.values()], axis=1))  # 拼接多相机图像
+                    for img in first_observation.images.values()], axis=1))  # 拼接多相机图像
         # 最多可视化 5 张
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        for i in range(min(5, len(next(iter(first_observation.images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)  # 在 step 0 记录图像
 
     # ---- RL signals quick check: rewards/discounts statistics (if present) ----
     try:
-        obs0 = batch[0]
+        obs0 = first_observation
         if hasattr(obs0, "rewards") and obs0.rewards is not None:
             rew = obs0.rewards
             rew_mean = float(jnp.mean(rew))
