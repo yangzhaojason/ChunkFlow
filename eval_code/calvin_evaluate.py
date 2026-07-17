@@ -5,8 +5,7 @@ CALVIN; benchmark modules are loaded only after user-supplied paths are checked.
 """
 
 import argparse
-from collections.abc import Callable
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import dataclasses
 import json
 import math
@@ -445,7 +444,8 @@ def _create_policy(args: argparse.Namespace, checkpoint_dir: Path) -> CalvinPoli
     )
     rtc_config = None
     if not args.disable_rtc:
-        rtc_config = RTCConfig(
+        rtc_config = RTCConfig.from_model_config(
+            config.model,
             overlap_size=args.overlap_size,
             blending_method=args.blending_method,
             replan_interval=args.replan_interval,

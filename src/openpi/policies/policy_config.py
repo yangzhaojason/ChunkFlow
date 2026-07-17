@@ -48,6 +48,11 @@ def create_trained_policy(
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
+    if is_pytorch and int(getattr(train_config.model, "history_length", 0)) > 0:
+        raise NotImplementedError(
+            "PyTorch policy inference does not yet support ChunkFlow executed-action history; "
+            "use a JAX checkpoint or set model.history_length=0"
+        )
 
     logging.info("Loading model...")
     if is_pytorch:

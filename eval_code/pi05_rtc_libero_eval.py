@@ -259,7 +259,11 @@ class Pi05RTCEvaluator:
                     f"replan_interval={self.args.replan_interval}")
 
         try:
-            rtc_config = RTCConfig(
+            from openpi.training import config as training_config
+
+            train_config = training_config.get_config(self.args.config)
+            rtc_config = RTCConfig.from_model_config(
+                train_config.model,
                 overlap_size=self.args.overlap_size,
                 blending_method=self.args.blending_method,
                 replan_interval=self.args.replan_interval,

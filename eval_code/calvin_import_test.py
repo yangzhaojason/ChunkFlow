@@ -195,6 +195,29 @@ def test_rtc_binarizes_gripper_after_overlap_blending():
     assert {float(action[-1]) for action in adapter.get_metrics()["action_history"]} <= {-1.0, 1.0}
 
 
+def test_calvin_policy_derives_rtc_history_length_from_training_config(monkeypatch, tmp_path):
+    module = importlib.import_module("eval_code.calvin_evaluate")
+    policy_config = importlib.import_module("openpi.policies.policy_config")
+    training_config = importlib.import_module("openpi.training.config")
+    model_config = type("ModelConfig", (), {"history_length": 3})()
+    train_config = type("TrainConfig", (), {"model": model_config})()
+    base_policy = _FakeChunkPolicy([np.zeros((4, 7), dtype=np.float32)])
+    monkeypatch.setattr(training_config, "get_config", lambda name: train_config)
+    monkeypatch.setattr(policy_config, "create_trained_policy", lambda *args, **kwargs: base_policy)
+    args = types.SimpleNamespace(
+        config_name="chunkflow",
+        pytorch_device=None,
+        disable_rtc=False,
+        overlap_size=2,
+        blending_method="linear",
+        replan_interval=2,
+    )
+
+    adapter = module._create_policy(args, tmp_path)  # noqa: SLF001
+
+    assert adapter._rtc_policy.config.history_length == 3  # noqa: SLF001
+
+
 class _FakeEnvironment:
     def __init__(self):
         self.reset_calls = []

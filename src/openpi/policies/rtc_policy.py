@@ -10,13 +10,15 @@ Key features:
 - Boundary consistency metrics
 """
 
+from collections import deque
+from collections.abc import Callable, Mapping
 import copy
-from collections.abc import Callable
 import dataclasses
-import numbers
-from typing import Any, Dict, Optional
-import numpy as np
 import logging
+import numbers
+from typing import Any
+
+import numpy as np
 
 logger = logging.getLogger("openpi")
 
@@ -43,17 +45,56 @@ class RTCConfig:
     # Whether to track temporal metrics
     track_metrics: bool = True
 
+    # Number of post-blending actions to condition the next chunk on
+    history_length: int = 0
+
     def __post_init__(self) -> None:
         if isinstance(self.overlap_size, bool) or not isinstance(self.overlap_size, numbers.Integral):
             raise ValueError("overlap_size must be an integer")
         if isinstance(self.replan_interval, bool) or not isinstance(self.replan_interval, numbers.Integral):
             raise ValueError("replan_interval must be an integer")
+        if isinstance(self.history_length, bool) or not isinstance(self.history_length, numbers.Integral):
+            raise ValueError("history_length must be an integer")
         if self.overlap_size < 0:
             raise ValueError("overlap_size must be non-negative")
         if self.replan_interval <= 0:
             raise ValueError("replan_interval must be positive")
+        if self.history_length < 0:
+            raise ValueError("history_length must be non-negative")
         if self.blending_method not in {"none", "linear", "cosine"}:
             raise ValueError(f"Unknown blending method: {self.blending_method}")
+
+    @staticmethod
+    def _model_history_length(model_config) -> int:
+        history_length = getattr(model_config, "history_length", 0)
+        if isinstance(history_length, bool) or not isinstance(history_length, numbers.Integral):
+            raise ValueError("model history_length must be an integer")
+        if history_length < 0:
+            raise ValueError("model history_length must be non-negative")
+        return int(history_length)
+
+    @classmethod
+    def from_model_config(cls, model_config, **kwargs) -> "RTCConfig":
+        """Create RTC settings with history length anchored to the trained model."""
+
+        model_history_length = cls._model_history_length(model_config)
+        explicit_history_length = kwargs.get("history_length", model_history_length)
+        if explicit_history_length != model_history_length:
+            raise ValueError(
+                "RTC history_length must match the model history_length "
+                f"({model_history_length}), got {explicit_history_length}"
+            )
+        return cls(**{**kwargs, "history_length": model_history_length})
+
+    def validate_model_config(self, model_config) -> None:
+        """Reject evaluation settings that differ from the trained token layout."""
+
+        model_history_length = self._model_history_length(model_config)
+        if self.history_length != model_history_length:
+            raise ValueError(
+                "RTC history_length must match the model history_length "
+                f"({model_history_length}), got {self.history_length}"
+            )
 
 
 class RTCPolicy:
@@ -72,6 +113,7 @@ class RTCPolicy:
         config: RTCConfig,
         *,
         action_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+        action_dim: int | None = None,
     ):
         """
         Initialize RTC policy wrapper.
@@ -81,6 +123,8 @@ class RTCPolicy:
             config: RTC configuration
             action_transform: Optional projection applied after overlap blending
                 and before the action is recorded or returned.
+            action_dim: Optional environment/output action width for policies that
+                do not expose it. The first chunk is used to learn it when omitted.
         """
         if action_transform is not None and not callable(action_transform):
             raise TypeError("action_transform must be callable")
@@ -88,12 +132,19 @@ class RTCPolicy:
         self.config = config
         self._action_transform = action_transform
 
+        if action_dim is not None:
+            action_dim = self._validate_action_dim(action_dim)
+        elif config.history_length > 0:
+            action_dim = self._discover_action_dim(base_policy)
+        self._initial_action_dim = action_dim
+
         # State for RTC execution
         self.current_chunk = None
         self.prev_chunk_tail = None
         self.step_in_chunk = 0
         self.total_steps = 0
-        self._action_dim = None
+        self._action_dim = self._initial_action_dim
+        self._executed_history = deque(maxlen=config.history_length)
 
         # Metrics tracking
         self.metrics = {
@@ -112,7 +163,8 @@ class RTCPolicy:
         self.prev_chunk_tail = None
         self.step_in_chunk = 0
         self.total_steps = 0
-        self._action_dim = None
+        self._action_dim = self._initial_action_dim
+        self._executed_history.clear()
 
         if self.config.track_metrics:
             self.metrics = {
@@ -122,7 +174,7 @@ class RTCPolicy:
                 'chunk_history': [],
             }
 
-    def infer(self, observation: Dict[str, Any]) -> Dict[str, Any]:
+    def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
         """
         Perform RTC inference.
 
@@ -140,7 +192,10 @@ class RTCPolicy:
 
         if need_new_chunk:
             # Get new chunk from base policy
-            result = self.base_policy.infer(observation)
+            policy_observation = self._with_executed_history(observation)
+            result = self.base_policy.infer(policy_observation)
+            if not isinstance(result, Mapping) or "actions" not in result:
+                raise ValueError("policy inference must return a mapping containing 'actions'")
             raw_chunk = np.asarray(result['actions'])
             if raw_chunk.ndim != 2:
                 raise ValueError("policy must output actions with shape [H, D]")
@@ -172,6 +227,10 @@ class RTCPolicy:
             if not np.all(np.isfinite(raw_chunk)):
                 raise ValueError("policy actions must contain only finite values")
             self._action_dim = raw_chunk.shape[1]
+            if self.config.history_length > 0 and self._initial_action_dim is None:
+                # Preserve the environment/output width across episode resets so
+                # subsequent first calls can receive an all-padding history.
+                self._initial_action_dim = self._action_dim
             new_chunk = raw_chunk.copy()
 
             # Store for metrics
@@ -231,12 +290,80 @@ class RTCPolicy:
         # Track action history
         if self.config.track_metrics:
             self.metrics['action_history'].append(action.copy())
+        self._executed_history.append(action.copy())
 
         # Update counters
         self.step_in_chunk += 1
         self.total_steps += 1
 
         return {'actions': action}
+
+    @staticmethod
+    def _validate_action_dim(action_dim: int) -> int:
+        if isinstance(action_dim, bool) or not isinstance(action_dim, numbers.Integral) or action_dim <= 0:
+            raise ValueError("action_dim must be a positive integer")
+        return int(action_dim)
+
+    @classmethod
+    def _discover_action_dim(cls, base_policy) -> int | None:
+        """Find an action width on a policy or one of its local wrappers."""
+
+        pending = [base_policy]
+        visited = set()
+        while pending:
+            candidate = pending.pop()
+            if id(candidate) in visited:
+                continue
+            visited.add(id(candidate))
+
+            action_dim = getattr(candidate, "action_dim", None)
+            if action_dim is not None:
+                return cls._validate_action_dim(action_dim)
+            for attribute in ("_base_policy", "_policy"):
+                wrapped = getattr(candidate, attribute, None)
+                if wrapped is not None:
+                    pending.append(wrapped)
+        return None
+
+    def _with_executed_history(self, observation: dict[str, Any]) -> dict[str, Any]:
+        """Attach right-aligned post-blending actions without mutating the caller."""
+
+        if self.config.history_length == 0:
+            return observation
+        if self._action_dim is None:
+            # Raw action width can differ from the model's padded action width.
+            # Learn it from the first returned chunk rather than guessing.
+            return observation
+
+        valid_count = len(self._executed_history)
+        if valid_count:
+            with np.errstate(over="ignore", invalid="ignore"):
+                executed = np.asarray(
+                    np.stack(tuple(self._executed_history), axis=0),
+                    dtype=np.float32,
+                )
+            if not np.all(np.isfinite(executed)):
+                raise ValueError(
+                    "executed action history must remain finite after float32 conversion"
+                )
+            history = np.zeros(
+                (self.config.history_length, self._action_dim),
+                dtype=executed.dtype,
+            )
+            history[-valid_count:] = executed
+        else:
+            history = np.zeros(
+                (self.config.history_length, self._action_dim),
+                dtype=np.float32,
+            )
+        history_mask = np.zeros((self.config.history_length,), dtype=bool)
+        if valid_count:
+            history_mask[-valid_count:] = True
+
+        policy_observation = dict(observation)
+        policy_observation["action_history"] = history
+        policy_observation["action_history_mask"] = history_mask
+        return policy_observation
 
     def _blend_chunks(self, prev_tail: np.ndarray, new_head: np.ndarray) -> np.ndarray:
         """
@@ -302,7 +429,7 @@ class RTCPolicy:
         difference = prev_tail.astype(np.float64) - new_head.astype(np.float64)
         return float(np.mean(np.linalg.norm(difference, axis=1)))
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         """
         Get collected metrics.
 
@@ -356,7 +483,7 @@ class RTCPolicy:
 
         return metrics
 
-    def _compute_frequency_metrics(self, actions: np.ndarray) -> Dict[str, float]:
+    def _compute_frequency_metrics(self, actions: np.ndarray) -> dict[str, float]:
         """
         Compute frequency-domain metrics.
 
@@ -406,8 +533,8 @@ class RTCPolicyWrapper:
     def create_from_checkpoint(
         config_name: str,
         checkpoint_dir: str,
-        rtc_config: Optional[RTCConfig] = None,
-        default_prompt: Optional[str] = None,
+        rtc_config: RTCConfig | None = None,
+        default_prompt: str | None = None,
     ):
         """
         Create RTC policy from checkpoint.
@@ -421,19 +548,20 @@ class RTCPolicyWrapper:
         Returns:
             RTCPolicy instance
         """
-        from openpi.training import config as _config
         from openpi.policies import policy_config as _policy_config
+        from openpi.training import config as _config
 
-        # Load base policy
         config = _config.get_config(config_name)
+        if rtc_config is None:
+            rtc_config = RTCConfig.from_model_config(config.model)
+        else:
+            rtc_config.validate_model_config(config.model)
+
+        # Load base policy only after checking the execution/model contract.
         base_policy = _policy_config.create_trained_policy(
             config,
             checkpoint_dir,
             default_prompt=default_prompt,
         )
-
-        # Create RTC wrapper
-        if rtc_config is None:
-            rtc_config = RTCConfig()
 
         return RTCPolicy(base_policy, rtc_config)
