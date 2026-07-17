@@ -8,6 +8,7 @@
 """
 
 import logging
+import numbers
 
 import einops
 import flax.nnx as nnx
@@ -18,12 +19,46 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models.chunkflow_history import validate_history
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 # 项目日志记录器
 logger = logging.getLogger("openpi")
+
+
+def history_action_masks(
+    history_mask: jax.Array,
+    *,
+    action_horizon: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Build validity and segment-start masks for history followed by future actions."""
+
+    history_mask = jnp.asarray(history_mask)
+    if history_mask.ndim != 2 or history_mask.dtype != jnp.bool_:
+        raise ValueError("history_mask must be bool [B, P]")
+    if (
+        isinstance(action_horizon, bool)
+        or not isinstance(action_horizon, numbers.Integral)
+        or action_horizon <= 0
+    ):
+        raise ValueError("action_horizon must be a positive integer")
+
+    action_mask = jnp.ones((history_mask.shape[0], action_horizon), dtype=jnp.bool_)
+    input_mask = jnp.concatenate([history_mask, action_mask], axis=1)
+    history_length = history_mask.shape[1]
+    history_ar = (
+        jnp.concatenate(
+            [jnp.ones((1,), dtype=jnp.bool_), jnp.zeros((history_length - 1,), dtype=jnp.bool_)]
+        )
+        if history_length > 0
+        else jnp.zeros((0,), dtype=jnp.bool_)
+    )
+    action_ar = jnp.concatenate(
+        [jnp.ones((1,), dtype=jnp.bool_), jnp.zeros((action_horizon - 1,), dtype=jnp.bool_)]
+    )
+    return input_mask, jnp.concatenate([history_ar, action_ar])
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -67,6 +102,7 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         # Pi05 开关：影响状态处理与 adaRMS 条件
         self.pi05 = config.pi05
+        self.history_length = config.history_length
         # Continuity regularization weights (ChunkFlow-style, no-RL)
         self.continuity_first_order_weight = getattr(
             config, "continuity_first_order_weight", 0.0
@@ -179,7 +215,23 @@ class Pi0(_model.BaseModel):
             input_mask.append(
                 jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
             # 图像/语言不去关注 state/action
-            ar_mask += [True]
+            ar_mask.append(jnp.array([True], dtype=jnp.bool_))
+
+        has_history = obs.action_history is not None
+        has_history_mask = obs.action_history_mask is not None
+        if has_history != has_history_mask:
+            raise ValueError("action_history and action_history_mask must be provided together")
+        if has_history:
+            validate_history(obs.action_history, obs.action_history_mask, action_dim=self.action_dim)
+            if obs.action_history.shape[0] != noisy_actions.shape[0]:
+                raise ValueError("action_history batch dimension must match noisy_actions")
+            if obs.action_history.shape[1] != self.history_length:
+                raise ValueError(
+                    f"action_history length {obs.action_history.shape[1]} does not match configured "
+                    f"history_length {self.history_length}"
+                )
+            history_tokens = self.action_in_proj(obs.action_history)
+            tokens.append(history_tokens)
 
         action_tokens = self.action_in_proj(noisy_actions)
         # 时间步正余弦位置编码（敏感度 [0,1]）
@@ -205,13 +257,27 @@ class Pi0(_model.BaseModel):
             action_expert_tokens = action_time_tokens
             adarms_cond = None
         tokens.append(action_expert_tokens)
-        input_mask.append(
-            jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
-        # 图像/语言/状态不去关注 action tokens（第一位遮蔽，后续允许因果）
-        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        if has_history:
+            history_and_action_mask, history_and_action_ar_mask = history_action_masks(
+                obs.action_history_mask,
+                action_horizon=self.action_horizon,
+            )
+            input_mask.append(history_and_action_mask)
+            ar_mask.append(history_and_action_ar_mask)
+        else:
+            input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
+            # 图像/语言/状态不去关注 action tokens（第一位遮蔽，后续允许因果）
+            ar_mask.append(
+                jnp.concatenate(
+                    [
+                        jnp.ones((1,), dtype=jnp.bool_),
+                        jnp.zeros((self.action_horizon - 1,), dtype=jnp.bool_),
+                    ]
+                )
+            )
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask = jnp.array(ar_mask)
+        ar_mask = jnp.concatenate(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
     @override

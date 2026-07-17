@@ -88,20 +88,12 @@ def test_with_real_dataset():
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 
-@dataclasses.dataclass(frozen=True)
-class _ChunkFlowFakeModelConfig(pi0_config.Pi0Config):
-    history_length: int = 1
-
-    @property
-    def chunkflow_supervised_enabled(self) -> bool:
-        return True
-
-
 def test_torch_loader_emits_paired_chunk_batch_when_supervision_is_enabled():
-    model_config = _ChunkFlowFakeModelConfig(
+    model_config = pi0_config.Pi0Config(
         action_dim=4,
         action_horizon=4,
         overlap_O=2,
+        history_length=1,
     )
     loader = _data_loader.create_torch_data_loader(
         _config.DataConfig(repo_id="fake"),
@@ -190,7 +182,12 @@ def test_rlds_loader_enables_episode_pairing_only_for_capable_dataset(monkeypatc
             return iter(())
 
     monkeypatch.setattr(_data_loader, "RLDSDataLoader", _CapturingRldsLoader)
-    model_config = _ChunkFlowFakeModelConfig(action_dim=4, action_horizon=4, overlap_O=2)
+    model_config = pi0_config.Pi0Config(
+        action_dim=4,
+        action_horizon=4,
+        overlap_O=2,
+        history_length=1,
+    )
 
     loader = _data_loader.create_rlds_data_loader(
         config_name="paired-test",
@@ -219,7 +216,12 @@ def test_rlds_loader_rejects_silent_legacy_fallback_for_chunkflow(monkeypatch):
         _data_loader.create_rlds_data_loader(
             config_name="legacy-test",
             data_config=_config.DataConfig(repo_id="test", rlds_data_dir="/tmp/test"),
-            model_config=_ChunkFlowFakeModelConfig(action_dim=4, action_horizon=4, overlap_O=2),
+            model_config=pi0_config.Pi0Config(
+                action_dim=4,
+                action_horizon=4,
+                overlap_O=2,
+                history_length=1,
+            ),
             action_horizon=4,
             batch_size=2,
             skip_norm_stats=True,

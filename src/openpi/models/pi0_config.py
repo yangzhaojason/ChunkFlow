@@ -7,24 +7,33 @@
 
 # 导入 dataclasses，用于声明不可变的数据类配置
 import dataclasses
+import math
+import numbers
+
 # TYPE_CHECKING 仅在静态类型检查时可用，避免运行期开销
 from typing import TYPE_CHECKING
 
 # 引入 Flax NNX（新的 Flax API）以创建/管理模块与参数
 import flax.nnx as nnx
+
 # 引入 JAX 顶层模块
 import jax
+
 # 引入 JAX 的 numpy 变体
 import jax.numpy as jnp
+
 # 覆写标注（typing_extensions.override）用于标记子类实现覆盖父类方法
 from typing_extensions import override
 
 # 导入本项目的模型基类定义
 from openpi.models import model as _model
+
 # 导入 Gemma/PaliGemma 相关变体定义与工具
 import openpi.models.gemma as _gemma
+
 # 项目内共享的数组类型定义
 from openpi.shared import array_typing as at
+
 # NNX 工具函数（路径匹配等）
 import openpi.shared.nnx_utils as nnx_utils
 
@@ -67,6 +76,14 @@ class Pi0Config(_model.BaseModelConfig):
     # Second-order smoothness weight: encourages |a_t - 2 a_{t-1} + a_{t-2}|^2 to be small
     continuity_second_order_weight: float = 0.0
 
+    # Executed-action history conditioning.
+    history_length: int = 0
+    history_noise_std: float = 0.0
+    history_dropout_probability: float = 0.0
+    history_schedule_warmup_steps: int = 0
+    history_schedule_ramp_steps: int = 1
+    history_schedule_max_alpha: float = 0.0
+
     # ChunkFlow-style RL regularization (simplified):
     # Self-consistency weight: predict twice with different noise, penalize disagreement
     self_consistency_weight: float = 0.0
@@ -97,6 +114,70 @@ class Pi0Config(_model.BaseModelConfig):
         # 若 discrete_state_input 未显式给定，默认为是否启用 Pi05
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+
+        if isinstance(self.action_horizon, bool) or not isinstance(self.action_horizon, numbers.Integral):
+            raise ValueError("action_horizon must be a positive integer")
+        if self.action_horizon <= 0:
+            raise ValueError("action_horizon must be a positive integer")
+        if isinstance(self.overlap_O, bool) or not isinstance(self.overlap_O, numbers.Integral):
+            raise ValueError("overlap_O must be an integer")
+        if not 0 <= self.overlap_O < self.action_horizon:
+            raise ValueError("overlap_O must satisfy 0 <= overlap_O < action_horizon")
+        if isinstance(self.history_length, bool) or not isinstance(self.history_length, numbers.Integral):
+            raise ValueError("history_length must be an integer")
+        if not 0 <= self.history_length <= self.chunk_stride:
+            raise ValueError("history_length must satisfy 0 <= history_length <= action_horizon - overlap_O")
+
+        for name in (
+            "history_schedule_warmup_steps",
+            "history_schedule_ramp_steps",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+                raise ValueError(f"{name} must be an integer")
+        if self.history_schedule_warmup_steps < 0:
+            raise ValueError("history_schedule_warmup_steps must be non-negative")
+        if self.history_schedule_ramp_steps <= 0:
+            raise ValueError("history_schedule_ramp_steps must be positive")
+
+        for name in (
+            "continuity_first_order_weight",
+            "continuity_second_order_weight",
+            "boundary_weight",
+            "history_noise_std",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.boundary_weight > 0 and self.overlap_O == 0:
+            raise ValueError("overlap_O must be positive when boundary_weight is nonzero")
+        for name in (
+            "history_dropout_probability",
+            "history_schedule_max_alpha",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or not 0 <= value <= 1
+            ):
+                raise ValueError(f"{name} must be finite and within [0, 1]")
+        if self.entropy_lambda != 0:
+            raise ValueError("entropy regularization is unsupported for ChunkFlow AWAC")
+
+    @property
+    def chunkflow_supervised_enabled(self) -> bool:
+        return self.history_length > 0 or self.boundary_weight > 0
+
+    @property
+    def chunk_stride(self) -> int:
+        return self.action_horizon - self.overlap_O
 
     @property
     @override
@@ -148,6 +229,18 @@ class Pi0Config(_model.BaseModelConfig):
                 # 语言 token 的有效位置 mask：[B, max_token_len]
                 tokenized_prompt_mask=jax.ShapeDtypeStruct(
                     [batch_size, self.max_token_len], bool),
+                action_history=(
+                    jax.ShapeDtypeStruct(
+                        [batch_size, self.history_length, self.action_dim], jnp.float32
+                    )
+                    if self.history_length > 0
+                    else None
+                ),
+                action_history_mask=(
+                    jax.ShapeDtypeStruct([batch_size, self.history_length], jnp.bool_)
+                    if self.history_length > 0
+                    else None
+                ),
             )
         # 动作张量规格：[B, T, action_dim]，T=action_horizon
         action_spec = jax.ShapeDtypeStruct(
