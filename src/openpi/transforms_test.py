@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import openpi.models.tokenizer as _tokenizer
+from openpi.shared import normalize as _normalize
 import openpi.transforms as _transforms
 
 
@@ -33,10 +34,120 @@ def test_delta_actions_noop():
     transform = _transforms.DeltaActions(mask=None)
     assert transform(item) is item
 
-    # No-op when there are no actions in the input.
+    # No-op when there are no action-like fields in the input.
     del item["actions"]
     transform = _transforms.DeltaActions(mask=[True, False])
     assert transform(item) is item
+
+
+def test_chunkflow_action_fields_share_delta_normalization_and_padding():
+    item = {
+        "state": np.array([8.0], dtype=np.float32),
+        "actions": np.array([[10.0], [12.0]], dtype=np.float32),
+        "action_history": np.array([[9.0], [11.0]], dtype=np.float32),
+        "executed_actions": np.array([[13.0]], dtype=np.float32),
+    }
+    originals = {key: value.copy() for key, value in item.items()}
+    stats = {
+        "actions": _normalize.NormStats(
+            mean=np.array([10.0], dtype=np.float32),
+            std=np.array([2.0], dtype=np.float32),
+        )
+    }
+
+    transformed = _transforms.compose(
+        [
+            _transforms.DeltaActions(mask=[True]),
+            _transforms.Normalize(stats),
+            _transforms.PadStatesAndActions(model_action_dim=3),
+        ]
+    )(item)
+
+    np.testing.assert_allclose(transformed["state"], [8.0, 0.0, 0.0])
+    np.testing.assert_allclose(
+        transformed["actions"],
+        [[-4.0, 0.0, 0.0], [-3.0, 0.0, 0.0]],
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        transformed["action_history"],
+        [[-4.5, 0.0, 0.0], [-3.5, 0.0, 0.0]],
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        transformed["executed_actions"],
+        [[-2.5, 0.0, 0.0]],
+        atol=1e-5,
+    )
+    for key, value in originals.items():
+        np.testing.assert_array_equal(item[key], value)
+
+
+def test_normalize_uses_action_quantiles_for_chunkflow_aliases():
+    stats = {
+        "actions": _normalize.NormStats(
+            mean=np.array([0.0]),
+            std=np.array([1.0]),
+            q01=np.array([2.0]),
+            q99=np.array([6.0]),
+        )
+    }
+    item = {
+        "actions": np.array([[2.0], [6.0]]),
+        "action_history": np.array([[3.0], [5.0]]),
+    }
+
+    transformed = _transforms.Normalize(stats, use_quantiles=True, strict=True)(item)
+
+    np.testing.assert_allclose(transformed["actions"], [[-1.0], [1.0]], atol=1e-5)
+    np.testing.assert_allclose(transformed["action_history"], [[-0.5], [0.5]], atol=1e-5)
+
+
+def test_masked_history_padding_stays_zero_through_action_transforms():
+    stats = {
+        "actions": _normalize.NormStats(
+            mean=np.array([10.0], dtype=np.float32),
+            std=np.array([2.0], dtype=np.float32),
+        )
+    }
+    item = {
+        "state": np.array([8.0], dtype=np.float32),
+        "actions": np.array([[10.0]], dtype=np.float32),
+        "action_history": np.array([[0.0], [9.0]], dtype=np.float32),
+        "action_history_mask": np.array([False, True]),
+    }
+
+    transformed = _transforms.compose(
+        [
+            _transforms.DeltaActions(mask=[True]),
+            _transforms.Normalize(stats),
+        ]
+    )(item)
+
+    np.testing.assert_allclose(transformed["action_history"], [[0.0], [-4.5]], atol=1e-5)
+
+
+def test_delta_cartesian_pose_transforms_all_chunkflow_action_fields_without_mutation():
+    state = np.array([1.0, 2.0, 3.0, 0.1, 0.2, 0.3, 9.0])
+    item = {
+        "state": state,
+        "actions": np.array([[2.0, 4.0, 6.0, 0.2, 0.4, 0.6, 8.0]]),
+        "action_history": np.array([[3.0, 5.0, 7.0, 0.3, 0.5, 0.7, 7.0]]),
+        "executed_actions": np.array([[4.0, 6.0, 8.0, 0.4, 0.6, 0.8, 6.0]]),
+    }
+    originals = {key: value.copy() for key, value in item.items()}
+
+    transformed = _transforms.DeltaCartesianPose(mask=_transforms.make_bool_mask(6, -1))(item)
+
+    np.testing.assert_allclose(transformed["actions"], [[1.0, 2.0, 3.0, 0.1, 0.2, 0.3, 8.0]])
+    np.testing.assert_allclose(
+        transformed["action_history"], [[2.0, 3.0, 4.0, 0.2, 0.3, 0.4, 7.0]]
+    )
+    np.testing.assert_allclose(
+        transformed["executed_actions"], [[3.0, 4.0, 5.0, 0.3, 0.4, 0.5, 6.0]]
+    )
+    for key, value in originals.items():
+        np.testing.assert_array_equal(item[key], value)
 
 
 def test_absolute_actions():

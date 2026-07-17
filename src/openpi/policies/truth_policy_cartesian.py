@@ -86,11 +86,15 @@ class TruthInputsCartesian(transforms.DataTransformFn):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
 
-        # Pass-through RL signals for AWAC if present
-        if "rewards" in data:
-            inputs["rewards"] = np.asarray(data["rewards"])
-        if "discounts" in data:
-            inputs["discounts"] = np.asarray(data["discounts"])
+        for key in (
+            "action_history",
+            "action_history_mask",
+            "rewards",
+            "discounts",
+            "executed_actions",
+        ):
+            if key in data and data[key] is not None:
+                inputs[key] = np.asarray(data[key])
 
         return inputs
 
@@ -146,6 +150,16 @@ class TruthInputsJointWithoutGripper(transforms.DataTransformFn):
             if isinstance(data["prompt"], bytes):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
+
+        for key in (
+            "action_history",
+            "action_history_mask",
+            "rewards",
+            "discounts",
+            "executed_actions",
+        ):
+            if key in data and data[key] is not None:
+                inputs[key] = np.asarray(data[key])
 
         return inputs
 

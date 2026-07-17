@@ -80,34 +80,17 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
-        # Pass-through RL signals for AWAC if present. If the dataset provides step-wise
-        # rewards/discounts aligned with the action horizon, we forward them directly.
-        # If only an episode-level success flag is present, synthesize sparse terminal
-        # rewards for the current chunk (reward=1 at last step iff success, else 0),
-        # and discounts with last step = 0.
-        if "rewards" in data:
-            inputs["rewards"] = np.asarray(data["rewards"])
-        elif "success" in data:
-            # Synthesize per-chunk sparse terminal reward from episode success.
-            # Infer horizon from actions if available; otherwise fallback to length-1.
-            T = int(inputs["actions"].shape[-2]) if "actions" in inputs else 1
-            rewards = np.zeros((T,), dtype=np.float32)
-            try:
-                is_success = bool(np.asarray(data["success"]).item())
-            except Exception:
-                is_success = False
-            rewards[-1] = 1.0 if is_success else 0.0
-            inputs["rewards"] = rewards
-
-        if "discounts" in data:
-            inputs["discounts"] = np.asarray(data["discounts"])
-        elif "rewards" in inputs:
-            # If we synthesized rewards (or only rewards are present), synthesize discounts
-            # with last step = 0 to indicate termination at the end of the chunk.
-            T = int(inputs["rewards"].shape[-1])
-            discounts = np.ones((T,), dtype=np.float32)
-            discounts[-1] = 0.0
-            inputs["discounts"] = discounts
+        # ChunkFlow fields must come from contiguous trajectory data. In particular,
+        # an episode-level success flag is not a valid per-chunk Bellman terminal.
+        for key in (
+            "action_history",
+            "action_history_mask",
+            "rewards",
+            "discounts",
+            "executed_actions",
+        ):
+            if key in data and data[key] is not None:
+                inputs[key] = np.asarray(data[key])
 
         return inputs
 

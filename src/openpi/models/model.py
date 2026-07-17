@@ -106,10 +106,15 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
-    # --- Optional RL fields (for AWAC fine-tuning) ---
-    # Per-step reward and discount aligned with action horizon [B, T]
+    # ChunkFlow history immediately preceding the current observation.
+    action_history: at.Float[ArrayT, "*b p ad"] | None = None
+    action_history_mask: at.Bool[ArrayT, "*b p"] | None = None
+
+    # Optional RL fields aligned with the action horizon.
     rewards: at.Float[ArrayT, "*b ah"] | None = None
     discounts: at.Float[ArrayT, "*b ah"] | None = None
+    executed_actions: at.Float[ArrayT, "*b ah ad"] | None = None
+
     # Previous chunk's tail actions for boundary consistency, length O
     prev_chunk_tail_actions: at.Float[ArrayT, "*b o ad"] | None = None
 
@@ -139,8 +144,11 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            action_history=data.get("action_history"),
+            action_history_mask=data.get("action_history_mask"),
             rewards=data.get("rewards"),
             discounts=data.get("discounts"),
+            executed_actions=data.get("executed_actions"),
             prev_chunk_tail_actions=data.get("prev_chunk_tail_actions"),
         )
 
@@ -224,6 +232,12 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        action_history=observation.action_history,
+        action_history_mask=observation.action_history_mask,
+        rewards=observation.rewards,
+        discounts=observation.discounts,
+        executed_actions=observation.executed_actions,
+        prev_chunk_tail_actions=observation.prev_chunk_tail_actions,
     )
 
 

@@ -1,5 +1,6 @@
 from flax import nnx
 import jax
+import numpy as np
 import pytest
 
 from openpi.models import model as _model
@@ -7,6 +8,54 @@ from openpi.models import pi0_config
 from openpi.models import pi0_fast
 from openpi.shared import download
 from openpi.shared import nnx_utils
+
+
+def _chunkflow_observation_dict():
+    images = {
+        key: np.zeros((1, 224, 224, 3), dtype=np.uint8)
+        for key in _model.IMAGE_KEYS
+    }
+    return {
+        "image": images,
+        "image_mask": {key: np.ones((1,), dtype=bool) for key in images},
+        "state": np.zeros((1, 2), dtype=np.float32),
+        "action_history": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+        "action_history_mask": np.array([[True, False]]),
+        "rewards": np.array([[0.0, 1.0]], dtype=np.float32),
+        "discounts": np.array([[1.0, 0.0]], dtype=np.float32),
+        "executed_actions": np.array([[[5.0, 6.0], [7.0, 8.0]]], dtype=np.float32),
+    }
+
+
+def test_observation_round_trips_chunkflow_fields():
+    data = _chunkflow_observation_dict()
+
+    observation = _model.Observation.from_dict(data)
+    restored = observation.to_dict()
+
+    for key in (
+        "action_history",
+        "action_history_mask",
+        "rewards",
+        "discounts",
+        "executed_actions",
+    ):
+        np.testing.assert_array_equal(restored[key], data[key])
+
+
+def test_preprocess_observation_preserves_chunkflow_fields():
+    observation = _model.Observation.from_dict(_chunkflow_observation_dict())
+
+    processed = _model.preprocess_observation(None, observation)
+
+    for field in (
+        "action_history",
+        "action_history_mask",
+        "rewards",
+        "discounts",
+        "executed_actions",
+    ):
+        np.testing.assert_array_equal(getattr(processed, field), getattr(observation, field))
 
 
 def test_pi0_model():

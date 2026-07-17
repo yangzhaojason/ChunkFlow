@@ -21,15 +21,15 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.truth_policy_cartesian as truth_policy_cartesian
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.truth_rlds_dataset as truth_rlds_dataset
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
-import openpi.training.truth_rlds_dataset as truth_rlds_dataset
-import openpi.policies.truth_policy_cartesian as truth_policy_cartesian
 
 CHUNKFLOW_LIBERO_DATASET = os.environ.get("CHUNKFLOW_LIBERO_DATASET", "datasets/libero_lerobot")
 CHUNKFLOW_REAL_DATA_DIR = os.environ.get("CHUNKFLOW_REAL_DATA_DIR", "datasets/real_robot")
@@ -326,12 +326,16 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
-    # Optional path to a JSON mapping {episode_index(int): success(bool/int)}.
-    # If provided and rewards/discounts are missing, we will synthesize them from success.
+    # Deprecated compatibility field. Episode success cannot define per-step Bellman signals.
     success_map_path: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.success_map_path is not None:
+            raise ValueError(
+                "success_map_path is not a valid ChunkFlow reward source; provide step-aligned rewards and discounts"
+            )
+
         # The repack transform is *only* applied to the data coming from the dataset,
         # and *not* during inference. We can use it to make inputs from the dataset look
         # as close as possible to those coming from the inference environment (e.g. match the keys).
@@ -352,8 +356,6 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         # Optional RL signals (only included if present in dataset)
                         "rewards": "rewards",
                         "discounts": "discounts",
-                        # Optional episode-level success flag for synthesizing rewards
-                        "success": "success",
                     }
                 )
             ]
@@ -366,21 +368,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
 
-        # If a success map is provided, inject sparse terminal rewards/discounts from it BEFORE LiberoInputs
-        # so that LiberoInputs can see and pass them through.
-        input_transforms = []
-        if self.success_map_path is not None:
-            import json  # local import to avoid global dependency at import time
-            with open(self.success_map_path, "r") as f:
-                raw_map = json.load(f)
-            # Normalize keys to int and values to bool
-            success_map = {int(k): bool(v) for k, v in raw_map.items()}
-            input_transforms.append(_transforms.InjectEpisodeSuccessRewards(success_map))
-
-        input_transforms.append(libero_policy.LiberoInputs(model_type=model_config.model_type))
-
         data_transforms = _transforms.Group(
-            inputs=input_transforms,
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
             outputs=[libero_policy.LiberoOutputs()],
         )
 

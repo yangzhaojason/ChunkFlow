@@ -71,6 +71,16 @@ class DroidInputs(transforms.DataTransformFn):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
 
+        for key in (
+            "action_history",
+            "action_history_mask",
+            "rewards",
+            "discounts",
+            "executed_actions",
+        ):
+            if key in data and data[key] is not None:
+                inputs[key] = np.asarray(data[key])
+
         return inputs
 
 

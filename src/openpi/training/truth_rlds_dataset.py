@@ -7,14 +7,45 @@ The data loader also applies a few DROID-specific data filters / transformations
 
 from enum import Enum
 from enum import auto
-import logging
 import json
-import tqdm
+import logging
+import os
 from pathlib import Path
 import pickle
-import os
+
+import numpy as np
+import tqdm
 
 import openpi.shared.download as download
+
+
+def paired_episode_action_windows(
+    actions: np.ndarray,
+    *,
+    horizon: int,
+    stride: int,
+    history_length: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Reference NumPy assembly for full, episode-local ChunkFlow windows."""
+
+    actions = np.asarray(actions)
+    if actions.ndim != 2:
+        raise ValueError("actions must be rank 2 [trajectory_length, action_dim]")
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    if stride <= 0 or stride > horizon:
+        raise ValueError("stride must satisfy 0 < stride <= horizon")
+    if not 0 <= history_length <= stride:
+        raise ValueError("history_length must satisfy 0 <= history_length <= stride")
+
+    pair_count = max(actions.shape[0] - stride - horizon + 1, 0)
+    starts = np.arange(0, pair_count, stride, dtype=np.int64)
+    offsets = np.arange(horizon, dtype=np.int64)
+    previous = actions[starts[:, None] + offsets[None, :]]
+    current = actions[starts[:, None] + stride + offsets[None, :]]
+    history = previous[:, stride - history_length : stride].copy()
+    history_mask = np.ones((starts.shape[0], history_length), dtype=bool)
+    return starts, previous, current, history, history_mask
 
 
 class TruthActionSpace(Enum):
@@ -46,10 +77,11 @@ class TruthRldsDataset:
         filter_dict_path=None,  # Path to json file with indices to sample during training
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
+        import os
+
         import dlimp as dl
         import tensorflow as tf
         import tensorflow_datasets as tfds
-        import os
 
         # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch / JAX)
         tf.config.set_visible_devices([], "GPU")
@@ -325,9 +357,9 @@ class TruthRldsDatasetCartesian:
 
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
+        import numpy as np
         import tensorflow as tf
         import tensorflow_datasets as tfds
-        import numpy as np
 
         # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch / JAX)
         tf.config.set_visible_devices([], "GPU")
@@ -651,6 +683,8 @@ class TruthRldsDatasetCartesian:
 
 
 class TruthRldsDatasetJointWithoutGripper:
+    supports_chunkflow_pairs = True
+
     def __init__(
         self,
         repo_id: str,
@@ -669,12 +703,13 @@ class TruthRldsDatasetJointWithoutGripper:
         # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
         num_parallel_calls: int = -1,
         filter_dict_path=None,  # Path to json file with indices to sample during training
+        chunkflow_stride: int | None = None,
+        history_length: int = 0,
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
         import tensorflow as tf
         import tensorflow_datasets as tfds
-        import os
 
         # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch / JAX)
         tf.config.set_visible_devices([], "GPU")
@@ -762,6 +797,12 @@ class TruthRldsDatasetJointWithoutGripper:
 
         dataset = dataset.traj_map(restructure, num_parallel_calls)
 
+        if chunkflow_stride is not None:
+            if not 0 < chunkflow_stride <= action_chunk_size:
+                raise ValueError("chunkflow_stride must satisfy 0 < stride <= action_chunk_size")
+            if not 0 <= history_length <= chunkflow_stride:
+                raise ValueError("history_length must satisfy 0 <= history_length <= chunkflow_stride")
+
         def chunk_actions(traj):
             """Splits episode into action chunks."""
             traj_len = tf.shape(traj["actions"])[0]
@@ -784,8 +825,6 @@ class TruthRldsDatasetJointWithoutGripper:
             traj["actions"] = tf.gather(traj["actions"], action_chunk_indices)
             return traj
 
-        dataset = dataset.traj_map(chunk_actions, num_parallel_calls)
-
         def filter_idle(traj):
             """Filter out chunks with idle actions.
             --> we filter if at least first half of chunk does not move.
@@ -803,11 +842,6 @@ class TruthRldsDatasetJointWithoutGripper:
                 tf.abs(traj["actions"][: action_chunk_size // 2]) > 1e-3
             )
 
-        dataset = dataset.filter(filter_idle)
-
-        # Flatten: map from trajectory dataset to dataset of individual action chunks
-        dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
-
         # Decode images: RLDS saves encoded images, only decode now for efficiency
         def decode_images(traj):
             traj["observation"]["image"] = tf.io.decode_image(
@@ -820,7 +854,82 @@ class TruthRldsDatasetJointWithoutGripper:
             )
             return traj
 
-        dataset = dataset.frame_map(decode_images, num_parallel_calls)
+        if chunkflow_stride is None:
+            dataset = dataset.traj_map(chunk_actions, num_parallel_calls)
+            dataset = dataset.filter(filter_idle)
+            dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
+            dataset = dataset.frame_map(decode_images, num_parallel_calls)
+        else:
+            stride = chunkflow_stride
+
+            def pair_chunks(traj):
+                """Build full adjacent windows while the episode axis still exists."""
+
+                traj_len = tf.shape(traj["actions"])[0]
+                pair_count = tf.maximum(traj_len - stride - action_chunk_size + 1, 0)
+                starts = tf.range(0, pair_count, delta=stride)
+                offsets = tf.range(action_chunk_size)[None, :]
+                previous_indices = starts[:, None] + offsets
+                current_indices = starts[:, None] + stride + offsets
+
+                previous_actions = tf.gather(traj["actions"], previous_indices)
+                current_actions = tf.gather(traj["actions"], current_indices)
+                previous_history_indices = starts[:, None] - history_length + tf.range(history_length)[None, :]
+                previous_history_mask = previous_history_indices >= 0
+                previous_history = tf.gather(traj["actions"], tf.maximum(previous_history_indices, 0))
+                previous_history = tf.where(
+                    previous_history_mask[..., None], previous_history, tf.zeros_like(previous_history)
+                )
+
+                def observation_at(indices):
+                    return {
+                        "image": tf.gather(traj["observation"]["image"], indices),
+                        "wrist_image": tf.gather(traj["observation"]["wrist_image"], indices),
+                        "joint_position": tf.gather(traj["observation"]["joint_position"], indices),
+                    }
+
+                previous = {
+                    "actions": previous_actions,
+                    "observation": observation_at(starts),
+                    "prompt": tf.gather(traj["prompt"], starts),
+                    "action_history": previous_history,
+                    "action_history_mask": previous_history_mask,
+                }
+                current = {
+                    "actions": current_actions,
+                    "observation": observation_at(starts + stride),
+                    "prompt": tf.gather(traj["prompt"], starts + stride),
+                    "action_history": previous_actions[:, stride - history_length : stride],
+                    "action_history_mask": tf.ones([tf.shape(starts)[0], history_length], dtype=tf.bool),
+                }
+                return {"previous": previous, "current": current}
+
+            def filter_idle_pair(pair):
+                actions = pair["current"]["actions"]
+                if action_space == TruthActionSpace.JOINT_POSITION:
+                    return tf.reduce_any(
+                        tf.abs(actions[: action_chunk_size // 2] - actions[:1]) > 1e-3
+                    )
+                return tf.reduce_any(tf.abs(actions[: action_chunk_size // 2]) > 1e-3)
+
+            def decode_pair_images(pair):
+                for key in ("previous", "current"):
+                    pair[key]["observation"]["image"] = tf.io.decode_image(
+                        pair[key]["observation"]["image"],
+                        expand_animations=False,
+                        dtype=tf.uint8,
+                    )
+                    pair[key]["observation"]["wrist_image"] = tf.io.decode_image(
+                        pair[key]["observation"]["wrist_image"],
+                        expand_animations=False,
+                        dtype=tf.uint8,
+                    )
+                return pair
+
+            dataset = dataset.traj_map(pair_chunks, num_parallel_calls)
+            dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
+            dataset = dataset.filter(filter_idle_pair)
+            dataset = dataset.frame_map(decode_pair_images, num_parallel_calls)
 
         # Shuffle, batch
         dataset = dataset.shuffle(shuffle_buffer_size)

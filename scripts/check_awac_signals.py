@@ -9,11 +9,11 @@ from __future__ import annotations
 import argparse
 import sys
 from typing import Any
-import dataclasses
 
 import jax
 import jax.numpy as jnp
 
+from openpi.training.chunkflow_batch import PairedChunkBatch
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 from openpi.transforms import flatten_dict
@@ -29,19 +29,9 @@ def _stats(x: Any) -> dict[str, float]:
     }
 
 
-def main(config_name: str, print_raw: bool, success_map_path: str | None) -> int:
+def main(config_name: str, *, print_raw: bool) -> int:
     cfg = _config.get_config(config_name)
     print(f"[Info] Loaded config: {cfg.name}")
-
-    # Optional: inject success_map_path into data config for Libero to synthesize rewards
-    if success_map_path is not None:
-        try:
-            # data config is frozen; create a new TrainConfig with updated data field
-            new_data = dataclasses.replace(cfg.data, success_map_path=success_map_path)
-            cfg = dataclasses.replace(cfg, data=new_data)
-            print(f"[Info] Using success_map_path: {success_map_path}")
-        except TypeError as e:
-            print(f"[Warning] Could not inject success_map_path into config: {e}", file=sys.stderr)
 
     # Optionally inspect a raw sample before transforms to see available keys
     if print_raw and cfg.data.create(cfg.assets_dirs, cfg.model).rlds_data_dir is None:
@@ -73,10 +63,14 @@ def main(config_name: str, print_raw: bool, success_map_path: str | None) -> int
     )
     it = iter(loader)
     try:
-        observation, actions = next(it)
+        batch = next(it)
     except StopIteration:
         print("[Error] Data loader yielded no batches.")
         return 1
+    if isinstance(batch, PairedChunkBatch):
+        observation, actions = batch.observation, batch.actions
+    else:
+        observation, actions = batch
 
     # Convert to host for printing
     obs = jax.tree.map(jax.device_get, observation)
@@ -107,7 +101,8 @@ def main(config_name: str, print_raw: bool, success_map_path: str | None) -> int
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", required=True, help="Training config name, e.g., pi05_libero")
-    parser.add_argument("--print-raw", action="store_true", help="Print raw dataset keys before transforms (LeRobot datasets).")
-    parser.add_argument("--success-map-path", type=str, default=None, help="Path to {episode_index: success} JSON for synthesizing rewards/discounts.")
+    parser.add_argument(
+        "--print-raw", action="store_true", help="Print raw dataset keys before transforms (LeRobot datasets)."
+    )
     args = parser.parse_args()
-    sys.exit(main(args.config_name, args.print_raw, args.success_map_path))
+    sys.exit(main(args.config_name, print_raw=args.print_raw))

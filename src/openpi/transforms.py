@@ -111,7 +111,7 @@ class RepackTransformOptional(DataTransformFn):
 
     structure: at.PyTree[str]
     # Keys to treat as optional (leaf names in the output structure).
-    optional_leaf_names: tuple[str, ...] = ("rewards", "discounts", "success")
+    optional_leaf_names: tuple[str, ...] = ("rewards", "discounts")
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
@@ -143,36 +143,6 @@ class RepackTransformOptional(DataTransformFn):
         result, _ = build(self.structure, None)
         return result
 
-
-@dataclasses.dataclass(frozen=True)
-class InjectEpisodeSuccessRewards(DataTransformFn):
-    """Inject sparse terminal rewards/discounts from an episode-level success map.
-
-    If `rewards`/`discounts` already exist, this is a no-op.
-    Otherwise, uses `episode_index` to look up success and generates:
-      rewards: zeros(T,), rewards[-1]=1.0 if success else 0.0
-      discounts: ones(T,), discounts[-1]=0.0
-    """
-
-    success_map: Mapping[int, bool]
-
-    def __call__(self, data: DataDict) -> DataDict:
-        if "rewards" in data and "discounts" in data:
-            return data
-        if "episode_index" not in data:
-            return data
-        T = int(data["actions"].shape[-2]) if "actions" in data else 1
-        rewards = np.zeros((T,), dtype=np.float32)
-        discounts = np.ones((T,), dtype=np.float32)
-        discounts[-1] = 0.0
-        ep = int(np.asarray(data["episode_index"]).item())
-        if bool(self.success_map.get(ep, False)):
-            rewards[-1] = 1.0
-        out = dict(data)
-        out["rewards"] = rewards
-        out["discounts"] = discounts
-        return out
-
 @dataclasses.dataclass(frozen=True)
 class InjectDefaultPrompt(DataTransformFn):
     prompt: str | None
@@ -190,6 +160,8 @@ class Normalize(DataTransformFn):
     use_quantiles: bool = False
     # If true, will raise an error if any of the keys in the norm stats are not present in the data.
     strict: bool = False
+    # Action-valued fields that share the canonical ``actions`` statistics.
+    action_aliases: tuple[str, ...] = ("action_history", "executed_actions")
 
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
@@ -199,12 +171,30 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
-        return apply_tree(
+        normalize_fn = self._normalize_quantile if self.use_quantiles else self._normalize
+        normalized = apply_tree(
             data,
             self.norm_stats,
-            self._normalize_quantile if self.use_quantiles else self._normalize,
+            normalize_fn,
             strict=self.strict,
         )
+
+        flat_stats = flatten_dict(self.norm_stats)
+        action_stats = flat_stats.get("actions")
+        flat_data = flatten_dict(normalized)
+        if action_stats is not None:
+            for alias in self.action_aliases:
+                # An explicitly configured alias has already been normalized above.
+                if alias in flat_data and flat_data[alias] is not None and alias not in flat_stats:
+                    flat_data[alias] = normalize_fn(flat_data[alias], action_stats)
+        if (
+            flat_data.get("action_history") is not None
+            and flat_data.get("action_history_mask") is not None
+        ):
+            flat_data["action_history"] = _zero_masked_history(
+                flat_data["action_history"], flat_data["action_history_mask"]
+            )
+        return unflatten_dict(flat_data)
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]
@@ -282,24 +272,32 @@ class DeltaActions(DataTransformFn):
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
+    action_keys: tuple[str, ...] = ("actions", "action_history", "executed_actions")
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        present_keys = tuple(key for key in self.action_keys if key in data and data[key] is not None)
+        if not present_keys or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state = np.asarray(data["state"])
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] -= np.expand_dims(
-            np.where(mask, state[..., :dims], 0), axis=-2)
+        if state.shape[-1] < dims:
+            raise ValueError(f"state has {state.shape[-1]} dimensions but delta mask has {dims}")
+        offset = np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
 
-        data["actions"] = actions
-        # actions = np.array(actions, copy=True)
-        # offset = np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        # actions[..., :dims] = actions[..., :dims] - offset
-        # data["actions"] = actions
-
-        return data
+        transformed = dict(data)
+        for key in present_keys:
+            actions = np.array(data[key], copy=True)
+            if actions.ndim < 2:
+                raise ValueError(f"{key} must have an action-sequence axis")
+            if actions.shape[-1] < dims:
+                raise ValueError(f"{key} has {actions.shape[-1]} dimensions but delta mask has {dims}")
+            actions[..., :dims] = actions[..., :dims] - offset
+            if key == "action_history" and "action_history_mask" in data:
+                actions = _zero_masked_history(actions, data["action_history_mask"])
+            transformed[key] = actions
+        return transformed
 
 
 @dataclasses.dataclass(frozen=True)
@@ -418,14 +416,19 @@ class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 
     model_action_dim: int
+    action_keys: tuple[str, ...] = ("actions", "action_history", "executed_actions")
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["state"] = pad_to_dim(
-            data["state"], self.model_action_dim, axis=-1)
-        if "actions" in data:
-            data["actions"] = pad_to_dim(
-                data["actions"], self.model_action_dim, axis=-1)
-        return data
+        transformed = dict(data)
+        transformed["state"] = pad_to_dim(
+            np.array(data["state"], copy=True), self.model_action_dim, axis=-1
+        )
+        for key in self.action_keys:
+            if key in data and data[key] is not None:
+                transformed[key] = pad_to_dim(
+                    np.array(data[key], copy=True), self.model_action_dim, axis=-1
+                )
+        return transformed
 
 
 def flatten_dict(tree: at.PyTree) -> dict:
@@ -522,6 +525,16 @@ def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.
     return x
 
 
+def _zero_masked_history(history: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    history = np.asarray(history)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != history.shape[:-1]:
+        raise ValueError(
+            f"action_history_mask shape {mask.shape} must match action_history prefix {history.shape[:-1]}"
+        )
+    return np.where(mask[..., None], history, np.zeros((), dtype=history.dtype))
+
+
 def make_bool_mask(*dims: int) -> tuple[bool, ...]:
     """Make a boolean mask for the given dimensions.
 
@@ -564,40 +577,38 @@ class DeltaCartesianPose(DataTransformFn):
     # 长度可以小于实际维度数。如果为None，此变换无效。
     # 参见 `make_bool_mask` 了解更多详情。
     mask: Sequence[bool] | None
+    action_keys: tuple[str, ...] = ("actions", "action_history", "executed_actions")
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        present_keys = tuple(key for key in self.action_keys if key in data and data[key] is not None)
+        if not present_keys or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state = np.asarray(data["state"])
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
 
-        if dims < 3:
-            raise ValueError(
-                "DeltaCartesianPose requires at least 3 dimensions (position)")
+        if dims not in (3, 7):
+            raise ValueError("DeltaCartesianPose mask must describe 3 position or 7 pose/gripper dimensions")
+        if state.shape[-1] < dims:
+            raise ValueError(f"state has {state.shape[-1]} dimensions but delta mask has {dims}")
 
-        # 位置部分（前3维）：按掩码相减
-        pos_mask = mask[:3]
-        pos_state = state[..., :3]
-        pos_state_masked = np.where(pos_mask, pos_state, 0)
-        actions[..., :3] -= np.expand_dims(pos_state_masked, axis=-2)
+        transformed = dict(data)
+        for key in present_keys:
+            actions = np.array(data[key], copy=True)
+            if actions.ndim < 2 or actions.shape[-1] < dims:
+                raise ValueError(f"{key} must have shape [..., horizon, action_dim >= {dims}]")
 
-        # 姿态欧拉角部分（后3维，弧度）：仅当提供7维时处理,前6个为true,最后一个为false
-        if dims == 7:
-            ang_mask = mask[3:6]
-            ang_state = state[..., 3:6]
-            ang_state_masked = np.where(ang_mask, ang_state, 0)
-            ang = actions[..., 3:6] - np.expand_dims(ang_state_masked, axis=-2)
-            # 归一化到[-pi, pi]
-            ang = (ang + np.pi) % (2 * np.pi) - np.pi
-            actions[..., 3:6] = ang
-        elif 3 < dims < 7:
-            raise ValueError(
-                "DeltaCartesianPose dims must be 3 or 6 (got partial angles)")
-        data["actions"] = actions
-
-        return data
+            pos_offset = np.expand_dims(np.where(mask[:3], state[..., :3], 0), axis=-2)
+            actions[..., :3] = actions[..., :3] - pos_offset
+            if dims == 7:
+                angle_offset = np.expand_dims(np.where(mask[3:6], state[..., 3:6], 0), axis=-2)
+                angles = actions[..., 3:6] - angle_offset
+                actions[..., 3:6] = (angles + np.pi) % (2 * np.pi) - np.pi
+            if key == "action_history" and "action_history_mask" in data:
+                actions = _zero_masked_history(actions, data["action_history_mask"])
+            transformed[key] = actions
+        return transformed
 
 
 @dataclasses.dataclass(frozen=True)

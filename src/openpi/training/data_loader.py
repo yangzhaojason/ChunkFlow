@@ -3,33 +3,43 @@ import logging
 import multiprocessing
 import os
 import typing
-from typing import Literal, Protocol, SupportsIndex, TypeVar, Union
+from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
+try:
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+except ModuleNotFoundError:  # Optional unless a LeRobot dataset is requested.
+    lerobot_dataset = None
+
 import openpi.models.model as _model
+from openpi.training import chunkflow_batch as _chunkflow_batch
 import openpi.training.config as _config
-from openpi.training.droid_rlds_dataset import DroidRldsDataset, DroidRldsNewDataset
-from openpi.training.truth_rlds_dataset import TruthRldsDataset, TruthRldsDatasetCartesian, TruthRldsDatasetJointWithoutGripper
+from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.droid_rlds_dataset import DroidRldsNewDataset
+from openpi.training.truth_rlds_dataset import TruthRldsDataset
+from openpi.training.truth_rlds_dataset import TruthRldsDatasetCartesian
+from openpi.training.truth_rlds_dataset import TruthRldsDatasetJointWithoutGripper
+
 # from openpi.training.franka_rlds_dataset import FrankaRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+TrainingBatch = tuple[_model.Observation, _model.Actions] | _chunkflow_batch.PairedChunkBatch
 
 # Type alias for all supported RLDS dataset types
-RLDSDatasetType = Union[
-    DroidRldsDataset,
-    DroidRldsNewDataset,
-    TruthRldsDataset,
-    TruthRldsDatasetCartesian,
+RLDSDatasetType = (
+    DroidRldsDataset
+    | DroidRldsNewDataset
+    | TruthRldsDataset
+    | TruthRldsDatasetCartesian
     # TruthRldsDatasetDualCartesian,
-    TruthRldsDatasetJointWithoutGripper,
+    | TruthRldsDatasetJointWithoutGripper
     # FrankaRldsDataset,
-]
+)
 
 # Mapping from config name to RLDS dataset class
 CONFIG_NAME: dict[str, type[RLDSDatasetType]] = {
@@ -106,6 +116,10 @@ class TransformedDataset(Dataset[T_co]):
     def __len__(self) -> int:
         return len(self._dataset)
 
+    @property
+    def source_dataset(self) -> Dataset:
+        return self._dataset
+
 
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
@@ -139,6 +153,74 @@ class IterableTransformedDataset(IterableDataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class IterablePairedTransformedDataset(IterableDataset[dict]):
+    """Apply one transform pipeline independently to pre-paired episode records."""
+
+    _OPTIONAL_FIELDS = (
+        "action_history",
+        "action_history_mask",
+        "rewards",
+        "discounts",
+        "executed_actions",
+    )
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        *,
+        pre_transforms: Sequence[_transforms.DataTransformFn] = (),
+        transforms: Sequence[_transforms.DataTransformFn] = (),
+        is_batched: bool = False,
+    ):
+        self._dataset = dataset
+        self._pre_transform = _transforms.compose(pre_transforms)
+        self._transform = _transforms.compose(transforms)
+        self._is_batched = is_batched
+
+    def __iter__(self):
+        for sample in self._dataset:
+            if not self._is_batched:
+                yield self._transform_pair(sample)
+                continue
+
+            leaves = [leaf for leaf in jax.tree.leaves(sample) if hasattr(leaf, "shape") and leaf.ndim > 0]
+            if not leaves:
+                raise ValueError("Cannot infer batch size from an empty paired sample")
+            batch_size = leaves[0].shape[0]
+            individual_samples = [
+                jax.tree.map(lambda x: x[i], sample)  # noqa: B023
+                for i in range(batch_size)
+            ]
+            transformed = [self._transform_pair(item) for item in individual_samples]
+            yield jax.tree.map(lambda *xs: np.stack(xs, axis=0), *transformed)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def _transform_pair(self, sample: dict) -> dict:
+        if set(sample) != {"previous", "current"}:
+            raise ValueError("paired iterable samples must contain exactly 'previous' and 'current'")
+
+        previous = self._transform_record(sample["previous"])
+        current = self._transform_record(sample["current"])
+        if "actions" not in previous or "actions" not in current:
+            raise KeyError("transformed paired records must contain actions")
+
+        return {
+            "previous_observation": {key: value for key, value in previous.items() if key != "actions"},
+            "previous_actions": previous["actions"],
+            "observation": {key: value for key, value in current.items() if key != "actions"},
+            "actions": current["actions"],
+            "step": np.int32(0),
+        }
+
+    def _transform_record(self, record: dict) -> dict:
+        optional = {key: record[key] for key in self._OPTIONAL_FIELDS if key in record}
+        transformed = dict(self._pre_transform(record))
+        transformed.update(optional)
+        return self._transform(transformed)
 
 
 class FakeDataset(Dataset):
@@ -182,6 +264,11 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    if lerobot_dataset is None:
+        raise ModuleNotFoundError(
+            "LeRobot dataset support is unavailable. Install the repository's locked lerobot dependency."
+        )
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
         repo_id,
         root=data_config.lerobot_root,
@@ -203,6 +290,23 @@ def create_torch_dataset(
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
+    pre_transforms, transforms = _input_transforms(
+        data_config, skip_norm_stats=skip_norm_stats
+    )
+
+    return TransformedDataset(
+        dataset,
+        [*pre_transforms, *transforms],
+    )
+
+
+def _input_transforms(
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool,
+) -> tuple[tuple[_transforms.DataTransformFn, ...], tuple[_transforms.DataTransformFn, ...]]:
+    """Split canonical repacking from action-coordinate/model transforms."""
+
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
@@ -212,15 +316,41 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
+    return (
+        tuple(data_config.repack_transforms.inputs),
+        (
             *data_config.data_transforms.inputs,
-            _transforms.Normalize(
-                norm_stats, use_quantiles=data_config.use_quantile_norm),
+            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
-        ],
+        ),
+    )
+
+
+def _episode_frame_arrays(dataset: Dataset) -> tuple[np.ndarray, np.ndarray]:
+    """Read stable episode/frame identity before any loader shuffle."""
+
+    raw_dataset = dataset
+    while isinstance(raw_dataset, TransformedDataset):
+        raw_dataset = raw_dataset.source_dataset
+
+    if isinstance(raw_dataset, FakeDataset):
+        size = len(raw_dataset)
+        return np.zeros((size,), dtype=np.int64), np.arange(size, dtype=np.int64)
+
+    for holder_name in ("hf_dataset", "dataset"):
+        holder = getattr(raw_dataset, holder_name, None)
+        if holder is None:
+            continue
+        try:
+            episode_ids = np.asarray(holder["episode_index"])
+            frame_indices = np.asarray(holder["frame_index"])
+        except (KeyError, TypeError):
+            continue
+        if episode_ids.ndim == 1 and frame_indices.ndim == 1:
+            return episode_ids, frame_indices
+
+    raise ValueError(
+        "ChunkFlow paired loading requires episode_index and frame_index arrays on the raw dataset"
     )
 
 
@@ -262,7 +392,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[TrainingBatch]:
     """Create a data loader for training.
 
     Args:
@@ -283,6 +413,7 @@ def create_data_loader(
         return create_rlds_data_loader(
             config_name=config.name,
             data_config=data_config,
+            model_config=config.model,
             action_horizon=config.model.action_horizon,
             batch_size=config.batch_size,
             sharding=sharding,
@@ -320,7 +451,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[TrainingBatch]:
     """Create a data loader for training.
 
     Args:
@@ -339,8 +470,33 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(
-        dataset, data_config, skip_norm_stats=skip_norm_stats)
+    if bool(getattr(model_config, "chunkflow_supervised_enabled", False)):
+        episode_ids, frame_indices = _episode_frame_arrays(dataset)
+        stride = int(
+            getattr(
+                model_config,
+                "chunk_stride",
+                action_horizon - int(getattr(model_config, "overlap_O", 0)),
+            )
+        )
+        history_length = int(getattr(model_config, "history_length", 0))
+        pre_transforms, transforms = _input_transforms(
+            data_config, skip_norm_stats=skip_norm_stats
+        )
+        dataset = _chunkflow_batch.PairedTransformedDataset(
+            dataset,
+            episode_ids=episode_ids,
+            frame_indices=frame_indices,
+            stride=stride,
+            history_length=history_length,
+            action_horizon=action_horizon,
+            pre_transforms=pre_transforms,
+            transforms=transforms,
+        )
+    else:
+        dataset = transform_dataset(
+            dataset, data_config, skip_norm_stats=skip_norm_stats
+        )
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -384,12 +540,13 @@ def create_rlds_data_loader(
     action_horizon: int,
     batch_size: int,
     *,
+    model_config: _model.BaseModelConfig | None = None,
     sharding: jax.sharding.Sharding | None = None,
     skip_norm_stats: bool = False,
     shuffle: bool = False,
     num_batches: int | None = None,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[TrainingBatch]:
     """Create an RLDS data loader for training.
 
     Note: This data loader requires some extra dependencies -- see examples/droid/README_train.md
@@ -413,6 +570,11 @@ def create_rlds_data_loader(
             "PyTorch RLDS data loader is not supported yet")
 
     dataset_class = CONFIG_NAME[config_name]
+    paired_enabled = bool(getattr(model_config, "chunkflow_supervised_enabled", False))
+    if paired_enabled and not bool(getattr(dataset_class, "supports_chunkflow_pairs", False)):
+        raise NotImplementedError(
+            f"{dataset_class.__name__} does not provide episode-aware paired chunks required by ChunkFlow"
+        )
 
     # 准备基础参数
     dataset_kwargs = {
@@ -424,9 +586,20 @@ def create_rlds_data_loader(
         "action_space": data_config.action_space,
         "filter_dict_path": data_config.filter_dict_path,
     }
+    if paired_enabled:
+        dataset_kwargs.update(
+            chunkflow_stride=int(
+                getattr(
+                    model_config,
+                    "chunk_stride",
+                    action_horizon - int(getattr(model_config, "overlap_O", 0)),
+                )
+            ),
+            history_length=int(getattr(model_config, "history_length", 0)),
+        )
 
-    # 对于支持 downsampled_and_repeated 的数据集类型，添加该参数
-    if dataset_class in (TruthRldsDatasetCartesian,):
+    # Add this option only for dataset implementations that support it.
+    if dataset_class == TruthRldsDatasetCartesian:
         dataset_kwargs["downsampled_and_repeated"] = data_config.downsampled_and_repeated
         if dataset_class == TruthRldsDatasetCartesian:
             logging.info(
@@ -447,9 +620,21 @@ def create_rlds_data_loader(
     # 创建数据集
     dataset = dataset_class(**dataset_kwargs)
 
-    # 应用数据转换
-    dataset = transform_iterable_dataset(
-        dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
+    # 应用数据转换。配对样本的两个 record 必须独立走同一条坐标变换链。
+    if paired_enabled:
+        pre_transforms, transforms = _input_transforms(
+            data_config, skip_norm_stats=skip_norm_stats
+        )
+        dataset = IterablePairedTransformedDataset(
+            dataset,
+            pre_transforms=pre_transforms,
+            transforms=transforms,
+            is_batched=True,
+        )
+    else:
+        dataset = transform_iterable_dataset(
+            dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True
+        )
 
     # 创建数据加载器
     data_loader = RLDSDataLoader(
@@ -605,6 +790,7 @@ class RLDSDataLoader:
         warned_remainder = False
         while True:
             data_iter = iter(self._dataset)
+            yielded_this_pass = False
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return
@@ -612,8 +798,11 @@ class RLDSDataLoader:
                     batch = next(data_iter)
                 except StopIteration:
                     # We've exhausted the dataset. Create a new iterator and start over.
+                    if not yielded_this_pass:
+                        raise RuntimeError(
+                            "RLDS dataset produced no batches; check episode lengths, pairing stride, and filters"
+                        ) from None
                     break
-                num_items += 1
                 # JAX data-parallel sharding over axis "B" requires the global batch dimension
                 # to be divisible by the number of devices. RLDS tf.data pipelines may yield
                 # a smaller final batch (no drop_remainder), which would crash here.
@@ -647,12 +836,14 @@ class RLDSDataLoader:
                         warned_remainder = True
 
                     batch = jax.tree.map(
-                        lambda x: x[:new0]
+                        lambda x, new0=new0, batch0=batch0: x[:new0]
                         if isinstance(x, np.ndarray) and x.ndim > 0 and x.shape[0] == batch0
                         else x,
                         batch,
                     )
 
+                num_items += 1
+                yielded_this_pass = True
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
@@ -666,4 +857,13 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            if "previous_observation" in batch:
+                yield _chunkflow_batch.PairedChunkBatch(
+                    previous_observation=_model.Observation.from_dict(batch["previous_observation"]),
+                    previous_actions=batch["previous_actions"],
+                    observation=_model.Observation.from_dict(batch["observation"]),
+                    actions=batch["actions"],
+                    step=batch["step"],
+                )
+            else:
+                yield _model.Observation.from_dict(batch), batch["actions"]
