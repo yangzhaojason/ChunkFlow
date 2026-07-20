@@ -22,6 +22,13 @@ class TrainState:
     ema_decay: float | None = struct.field(pytree_node=False)
     ema_params: nnx.State | None = None
 
+    critic_params: nnx.State | None = None
+    critic_model_def: nnx.GraphDef | None = None
+    critic_opt_state: optax.OptState | None = None
+    target_v_params: nnx.State | None = None
+    target_v_model_def: nnx.GraphDef | None = None
+    reference_params: nnx.State | None = None
+
 
 @at.typecheck
 def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> str:

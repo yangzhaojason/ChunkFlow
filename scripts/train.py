@@ -25,6 +25,7 @@ import optax  # 优化器库
 import tqdm_loggable.auto as tqdm  # 可记录到日志的 tqdm 进度条
 import wandb  # Weights & Biases 日志
 
+from openpi.models import chunkflow_critic as _chunkflow_critic
 import openpi.models.model as _model  # 项目：模型基类与类型
 import openpi.shared.array_typing as at  # 项目：数组/类型别名
 import openpi.shared.nnx_utils as nnx_utils  # 项目：NNX 工具函数
@@ -130,7 +131,7 @@ def init_train_state(
         config.optimizer, config.lr_schedule, weight_decay_mask=None)  # 构建优化器与学习率计划
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:  # 内部初始化函数
-        rng, model_rng = jax.random.split(rng)  # 拆分随机数键
+        critic_rng, model_rng = jax.random.split(rng)  # 拆分随机数键
         # 初始化模型与参数
         model = config.model.create(model_rng)  # 根据配置创建模型实例
 
@@ -151,6 +152,22 @@ def init_train_state(
         params = nnx_utils.state_map(
             params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))  # 冻结参数降精度
 
+        critic_params = critic_model_def = critic_opt_state = None
+        target_v_params = target_v_model_def = reference_params = None
+        if bool(getattr(config.model, "awac_enable", False)):
+            critic = _chunkflow_critic.ChunkFlowCritic(
+                state_dim=model.critic_state_dim,
+                action_dim=config.model.action_dim,
+                hidden_width=config.model.awac_critic_hidden_width,
+                hidden_depth=config.model.awac_critic_depth,
+                rngs=nnx.Rngs(critic_rng),
+            )
+            target_v_model_def = nnx.graphdef(critic.v)
+            target_v_params = jax.tree.map(lambda value: value, nnx.state(critic.v))
+            critic_model_def, critic_params = nnx.split(critic)
+            critic_opt_state = tx.init(critic_params)
+            reference_params = jax.tree.map(lambda value: value, params)
+
         return training_utils.TrainState(
             step=0,  # 初始步数
             params=params,  # 全量参数状态
@@ -160,6 +177,12 @@ def init_train_state(
                 config.trainable_filter)),  # 初始化可训练参数的优化器状态
             ema_decay=config.ema_decay,  # EMA 衰减系数
             ema_params=None if config.ema_decay is None else params,  # EMA 初值（如启用）
+            critic_params=critic_params,
+            critic_model_def=critic_model_def,
+            critic_opt_state=critic_opt_state,
+            target_v_params=target_v_params,
+            target_v_model_def=target_v_model_def,
+            reference_params=reference_params,
         )
 
     # 计算初始化形状与分片策略（恢复模式直接用此信息加载）
@@ -182,6 +205,11 @@ def init_train_state(
         in_shardings=replicated_sharding,  # 输入分片策略
         out_shardings=state_sharding,  # 输出分片策略
     )(init_rng, partial_params)  # 执行初始化
+
+    _checkpoints.validate_awac_state(
+        train_state,
+        awac_enabled=bool(getattr(config.model, "awac_enable", False)),
+    )
 
     return train_state, state_sharding  # 返回状态与分片
 
@@ -374,6 +402,10 @@ def main(config: _config.TrainConfig):  # 主函数：训练入口
     if resuming:  # 若恢复，则还原状态（包含数据迭代器位置）
         train_state = _checkpoints.restore_state(
             checkpoint_manager, train_state, data_loader)
+        _checkpoints.validate_awac_state(
+            train_state,
+            awac_enabled=bool(getattr(config.model, "awac_enable", False)),
+        )
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),  # 绑定配置，得到无 config 参数的函数

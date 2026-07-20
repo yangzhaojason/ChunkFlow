@@ -9,8 +9,10 @@ import optax
 import pytest
 
 from openpi.models import model as _model
+from openpi.training import checkpoints
 from openpi.training import chunkflow_batch
 from openpi.training import config as _config
+from openpi.training import sharding
 from openpi.training import utils as training_utils
 from scripts import train
 
@@ -19,6 +21,7 @@ class _ToyModel(_model.BaseModel):
     def __init__(self, rngs=None):
         del rngs
         super().__init__(action_dim=1, action_horizon=2, max_token_len=1)
+        self.critic_state_dim = 3
         self.weight = nnx.Param(jnp.array(1.0))
 
     def compute_loss(self, rng, observation, actions, *, train=False):
@@ -54,6 +57,9 @@ class _ToyModelConfig(_model.BaseModelConfig):
     max_token_len: int = 1
     history_length: int = 1
     chunkflow_supervised_enabled: bool = True
+    awac_enable: bool = False
+    awac_critic_hidden_width: int = 4
+    awac_critic_depth: int = 1
 
     @property
     def model_type(self):
@@ -65,6 +71,17 @@ class _ToyModelConfig(_model.BaseModelConfig):
 
     def inputs_spec(self, *, batch_size=1):
         raise NotImplementedError
+
+
+@dataclasses.dataclass(frozen=True)
+class _ConstantWeightLoader:
+    value: float
+
+    def load(self, params):
+        return jax.tree.map(
+            lambda spec: jnp.full(spec.shape, self.value, dtype=spec.dtype),
+            params,
+        )
 
 
 def _observation(batch_size=2):
@@ -88,6 +105,78 @@ def _state(config):
         ema_decay=0.9,
         ema_params=params,
     )
+
+
+def _assert_state_equal(actual: nnx.State, expected: nnx.State) -> None:
+    actual_dict = actual.to_pure_dict()
+    expected_dict = expected.to_pure_dict()
+    assert jax.tree.structure(actual_dict) == jax.tree.structure(expected_dict)
+    for actual_leaf, expected_leaf in zip(
+        jax.tree.leaves(actual_dict),
+        jax.tree.leaves(expected_dict),
+        strict=True,
+    ):
+        assert jnp.array_equal(actual_leaf, expected_leaf)
+
+
+def _tiny_awac_config(*, awac_enable: bool) -> _config.TrainConfig:
+    return _config.TrainConfig(
+        name="toy-awac",
+        exp_name="toy",
+        model=_ToyModelConfig(awac_enable=awac_enable),
+        weight_loader=_ConstantWeightLoader(7.0),
+        freeze_filter=nnx.Param,
+    )
+
+
+def _single_device_mesh() -> jax.sharding.Mesh:
+    return sharding.make_mesh(1)
+
+
+def test_awac_initialization_snapshots_loaded_actor_and_copies_online_value():
+    state, _ = train.init_train_state(
+        _tiny_awac_config(awac_enable=True),
+        jax.random.key(0),
+        _single_device_mesh(),
+        resume=False,
+    )
+
+    assert state.critic_params is not None
+    assert state.critic_model_def is not None
+    assert state.critic_opt_state is not None
+    assert state.target_v_params is not None
+    assert state.target_v_model_def is not None
+    assert state.reference_params is not None
+    _assert_state_equal(state.params, state.reference_params)
+    actor_leaves = jax.tree.leaves(state.params.to_pure_dict())
+    assert actor_leaves
+    assert all(jnp.all(value == 7.0) for value in actor_leaves)
+    assert all(value.dtype == jnp.bfloat16 for value in actor_leaves)
+
+    critic = nnx.merge(state.critic_model_def, state.critic_params)
+    _assert_state_equal(nnx.state(critic.v), state.target_v_params)
+
+
+def test_awac_off_initialization_keeps_training_only_state_empty():
+    state, _ = train.init_train_state(
+        _tiny_awac_config(awac_enable=False),
+        jax.random.key(1),
+        _single_device_mesh(),
+        resume=False,
+    )
+
+    assert all(
+        getattr(state, field) is None
+        for field in (
+            "critic_params",
+            "critic_model_def",
+            "critic_opt_state",
+            "target_v_params",
+            "target_v_model_def",
+            "reference_params",
+        )
+    )
+    checkpoints.validate_awac_state(state, awac_enabled=False)
 
 
 def test_train_step_consumes_paired_batch_and_replaces_loader_step():

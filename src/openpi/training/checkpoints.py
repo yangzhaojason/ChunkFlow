@@ -16,6 +16,29 @@ import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
+_AWAC_STATE_FIELDS = (
+    "critic_params",
+    "critic_model_def",
+    "critic_opt_state",
+    "target_v_params",
+    "target_v_model_def",
+    "reference_params",
+)
+
+
+def validate_awac_state(state: training_utils.TrainState, *, awac_enabled: bool) -> None:
+    if awac_enabled:
+        missing = [field for field in _AWAC_STATE_FIELDS if getattr(state, field) is None]
+        if missing:
+            raise ValueError(f"AWAC training state is missing required fields: {', '.join(missing)}")
+        return
+
+    unexpected = [field for field in _AWAC_STATE_FIELDS if getattr(state, field) is not None]
+    if unexpected:
+        raise ValueError(
+            f"AWAC is disabled but training state has unexpected fields: {', '.join(unexpected)}"
+        )
+
 
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
