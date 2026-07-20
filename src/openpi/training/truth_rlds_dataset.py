@@ -9,14 +9,53 @@ from enum import Enum
 from enum import auto
 import json
 import logging
+import numbers
 import os
 from pathlib import Path
 import pickle
+from typing import Literal
 
 import numpy as np
 import tqdm
 
 import openpi.shared.download as download
+from openpi.training.chunkflow_rlds import build_tf_paired_chunks
+from openpi.training.chunkflow_rlds import build_tf_step_transitions
+
+
+def _validate_chunkflow_options(
+    *,
+    mode: object,
+    action_chunk_size: object,
+    stride: object,
+    history_length: object,
+    seed: object,
+) -> tuple[Literal["legacy", "paired", "transition"], int, int | None, int, int]:
+    if not isinstance(mode, str) or mode not in {"legacy", "paired", "transition"}:
+        raise ValueError("chunkflow_mode must be one of: legacy, paired, transition")
+    for name, value in (
+        ("action_chunk_size", action_chunk_size),
+        ("history_length", history_length),
+        ("seed", seed),
+    ):
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise ValueError(f"{name} must be an integer")
+    action_chunk_size = int(action_chunk_size)
+    history_length = int(history_length)
+    seed = int(seed)
+    if action_chunk_size <= 0:
+        raise ValueError("action_chunk_size must be positive")
+    if not 0 <= history_length <= action_chunk_size:
+        raise ValueError("history_length must satisfy 0 <= history_length <= action_chunk_size")
+    if stride is not None:
+        if isinstance(stride, bool) or not isinstance(stride, numbers.Integral):
+            raise ValueError("chunkflow_stride must be an integer")
+        stride = int(stride)
+        if not 0 < stride <= action_chunk_size:
+            raise ValueError("chunkflow_stride must satisfy 0 < stride <= action_chunk_size")
+    if mode != "legacy" and stride is None:
+        raise ValueError("chunkflow_stride is required in paired and transition modes")
+    return mode, action_chunk_size, stride, history_length, seed
 
 
 def paired_episode_action_windows(
@@ -693,6 +732,7 @@ class TruthRldsDatasetCartesian:
 
 class TruthRldsDatasetJointWithoutGripper:
     supports_chunkflow_pairs = True
+    supports_chunkflow_transitions = True
 
     def __init__(
         self,
@@ -712,9 +752,18 @@ class TruthRldsDatasetJointWithoutGripper:
         # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
         num_parallel_calls: int = -1,
         filter_dict_path=None,  # Path to json file with indices to sample during training
+        chunkflow_mode: Literal["legacy", "paired", "transition"] = "legacy",
         chunkflow_stride: int | None = None,
         history_length: int = 0,
+        seed: int = 0,
     ):
+        chunkflow_mode, action_chunk_size, chunkflow_stride, history_length, seed = _validate_chunkflow_options(
+            mode=chunkflow_mode,
+            action_chunk_size=action_chunk_size,
+            stride=chunkflow_stride,
+            history_length=history_length,
+            seed=seed,
+        )
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
         import tensorflow as tf
@@ -728,7 +777,7 @@ class TruthRldsDatasetJointWithoutGripper:
         dataset = dl.DLataset.from_rlds(
             builder,
             split="train",
-            shuffle=shuffle,
+            shuffle=shuffle if chunkflow_mode == "legacy" else False,
             num_parallel_reads=num_parallel_reads,
         )
 
@@ -794,7 +843,7 @@ class TruthRldsDatasetJointWithoutGripper:
 
             instruction = tf.cond(has_007, _mapped_instruction, _fallback_instruction)
 
-            return {
+            record = {
                 "actions": actions,
                 "observation": {
                     "image": exterior_img,
@@ -803,14 +852,38 @@ class TruthRldsDatasetJointWithoutGripper:
                 },
                 "prompt": instruction,
             }
+            if chunkflow_mode == "legacy":
+                return record
+
+            record.update(
+                executed_actions=actions,
+                episode_id=tf.cast(traj["_traj_index"], tf.int32),
+                frame_index=tf.cast(traj["_frame_index"], tf.int32),
+            )
+            if "reward" in traj:
+                record["rewards"] = tf.reshape(traj["reward"], [-1])
+            elif chunkflow_mode == "transition":
+                raise KeyError("transition mode requires the source reward tensor")
+
+            if "discount" in traj:
+                record["discounts"] = tf.reshape(traj["discount"], [-1])
+            elif chunkflow_mode == "transition":
+                terminal_signals = []
+                if "is_terminal" in traj:
+                    terminal_signals.append(tf.reshape(traj["is_terminal"], [-1]))
+                if "is_last" in traj:
+                    terminal_signals.append(tf.reshape(traj["is_last"], [-1]))
+                if not terminal_signals:
+                    raise KeyError(
+                        "transition mode requires source discount or explicit is_terminal/is_last"
+                    )
+                terminal = terminal_signals[0]
+                for signal in terminal_signals[1:]:
+                    terminal = tf.logical_or(terminal, signal)
+                record["discounts"] = 1.0 - tf.cast(terminal, tf.float32)
+            return record
 
         dataset = dataset.traj_map(restructure, num_parallel_calls)
-
-        if chunkflow_stride is not None:
-            if not 0 < chunkflow_stride <= action_chunk_size:
-                raise ValueError("chunkflow_stride must satisfy 0 < stride <= action_chunk_size")
-            if not 0 <= history_length <= action_chunk_size:
-                raise ValueError("history_length must satisfy 0 <= history_length <= action_chunk_size")
 
         def chunk_actions(traj):
             """Splits episode into action chunks."""
@@ -863,60 +936,12 @@ class TruthRldsDatasetJointWithoutGripper:
             )
             return traj
 
-        if chunkflow_stride is None:
+        if chunkflow_mode == "legacy":
             dataset = dataset.traj_map(chunk_actions, num_parallel_calls)
             dataset = dataset.filter(filter_idle)
             dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
             dataset = dataset.frame_map(decode_images, num_parallel_calls)
-        else:
-            stride = chunkflow_stride
-
-            def pair_chunks(traj):
-                """Build full adjacent windows while the episode axis still exists."""
-
-                traj_len = tf.shape(traj["actions"])[0]
-                pair_count = tf.maximum(traj_len - stride - action_chunk_size + 1, 0)
-                starts = tf.range(0, pair_count, delta=stride)
-                offsets = tf.range(action_chunk_size)[None, :]
-                previous_indices = starts[:, None] + offsets
-                current_indices = starts[:, None] + stride + offsets
-
-                previous_actions = tf.gather(traj["actions"], previous_indices)
-                current_actions = tf.gather(traj["actions"], current_indices)
-
-                def gather_history(starts_to_condition):
-                    indices = starts_to_condition[:, None] - history_length + tf.range(history_length)[None, :]
-                    mask = indices >= 0
-                    values = tf.gather(traj["actions"], tf.maximum(indices, 0))
-                    values = tf.where(mask[..., None], values, tf.zeros_like(values))
-                    return values, mask
-
-                previous_history, previous_history_mask = gather_history(starts)
-                current_history, current_history_mask = gather_history(starts + stride)
-
-                def observation_at(indices):
-                    return {
-                        "image": tf.gather(traj["observation"]["image"], indices),
-                        "wrist_image": tf.gather(traj["observation"]["wrist_image"], indices),
-                        "joint_position": tf.gather(traj["observation"]["joint_position"], indices),
-                    }
-
-                previous = {
-                    "actions": previous_actions,
-                    "observation": observation_at(starts),
-                    "prompt": tf.gather(traj["prompt"], starts),
-                    "action_history": previous_history,
-                    "action_history_mask": previous_history_mask,
-                }
-                current = {
-                    "actions": current_actions,
-                    "observation": observation_at(starts + stride),
-                    "prompt": tf.gather(traj["prompt"], starts + stride),
-                    "action_history": current_history,
-                    "action_history_mask": current_history_mask,
-                }
-                return {"previous": previous, "current": current}
-
+        elif chunkflow_mode == "paired":
             def filter_idle_pair(pair):
                 actions = pair["current"]["actions"]
                 if action_space == TruthActionSpace.JOINT_POSITION:
@@ -939,13 +964,47 @@ class TruthRldsDatasetJointWithoutGripper:
                     )
                 return pair
 
-            dataset = dataset.traj_map(pair_chunks, num_parallel_calls)
+            dataset = dataset.traj_map(
+                lambda traj: build_tf_paired_chunks(
+                    traj,
+                    horizon=action_chunk_size,
+                    stride=chunkflow_stride,
+                    history_length=history_length,
+                    tf=tf,
+                ),
+                num_parallel_calls,
+            )
             dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
             dataset = dataset.filter(filter_idle_pair)
             dataset = dataset.frame_map(decode_pair_images, num_parallel_calls)
+        else:
+            def decode_transition_images(transition):
+                for key in ("current", "next"):
+                    transition[key]["observation"]["image"] = tf.io.decode_image(
+                        transition[key]["observation"]["image"],
+                        expand_animations=False,
+                        dtype=tf.uint8,
+                    )
+                    transition[key]["observation"]["wrist_image"] = tf.io.decode_image(
+                        transition[key]["observation"]["wrist_image"],
+                        expand_animations=False,
+                        dtype=tf.uint8,
+                    )
+                return transition
+
+            dataset = dataset.traj_map(
+                lambda traj: build_tf_step_transitions(
+                    traj,
+                    history_length=history_length,
+                    tf=tf,
+                ),
+                num_parallel_calls,
+            )
+            dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
+            dataset = dataset.frame_map(decode_transition_images, num_parallel_calls)
 
         # Shuffle, batch
-        dataset = dataset.shuffle(shuffle_buffer_size)
+        dataset = dataset.shuffle(shuffle_buffer_size, seed=seed)
         dataset = dataset.batch(batch_size)
         # Note =>> Seems to reduce memory usage without affecting speed?
         dataset = dataset.with_ram_budget(1)

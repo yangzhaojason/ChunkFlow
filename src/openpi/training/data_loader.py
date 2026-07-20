@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import copy
 import logging
 import multiprocessing
 import os
@@ -252,6 +253,214 @@ class IterablePairedTransformedDataset(IterableDataset[dict]):
         return self._transform(transformed)
 
 
+class IterableTransitionTransformedDataset(IterableDataset[dict]):
+    """Transform strict episode-local RLDS transitions without re-pairing time."""
+
+    _TOP_LEVEL_FIELDS = frozenset({
+        "current",
+        "next",
+        "reward",
+        "continuation",
+        "episode_id",
+        "frame_index",
+    })
+    _OPTIONAL_FIELDS = (
+        "action_history",
+        "action_history_mask",
+        "rewards",
+        "discounts",
+        "executed_actions",
+    )
+    _OBSERVATION_EXCLUSIONS = frozenset({"actions", "executed_actions", "rewards", "discounts"})
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        *,
+        pre_transforms: Sequence[_transforms.DataTransformFn] = (),
+        transforms: Sequence[_transforms.DataTransformFn] = (),
+        is_batched: bool = False,
+    ):
+        self._dataset = dataset
+        self._pre_transform = _transforms.compose(pre_transforms)
+        self._transform = _transforms.compose(transforms)
+        self._is_batched = is_batched
+
+    def __iter__(self):
+        for sample in self._dataset:
+            self._validate_top_level(sample)
+            if not self._is_batched:
+                yield self._transform_transition(sample)
+                continue
+
+            self._validate_batched_scalar_fields(sample)
+            leaves = [leaf for leaf in jax.tree.leaves(sample) if hasattr(leaf, "shape") and leaf.ndim > 0]
+            if not leaves:
+                raise ValueError("Cannot infer batch size from an empty transition sample")
+            batch_size = leaves[0].shape[0]
+            if any(leaf.shape[0] != batch_size for leaf in leaves):
+                raise ValueError("batched transition leaves must share one batch dimension")
+            individual_samples = [
+                jax.tree.map(lambda x: x[i], sample)  # noqa: B023
+                for i in range(batch_size)
+            ]
+            transformed = [self._transform_transition(item) for item in individual_samples]
+            yield jax.tree.map(lambda *xs: np.stack(xs, axis=0), *transformed)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def _transform_transition(self, sample: dict) -> dict:
+        self._validate_top_level(sample)
+        observation, executed_action = self._transform_record(sample["current"], name="current")
+        next_observation, next_executed_action = self._transform_record(sample["next"], name="next")
+        if executed_action.shape != next_executed_action.shape:
+            raise ValueError("current and next transformed executed actions must have identical shape")
+        if executed_action.dtype != next_executed_action.dtype:
+            raise ValueError("current and next transformed executed actions must have identical dtype")
+
+        reward = self._float32_scalar(sample["reward"], name="reward")
+        continuation = self._float32_scalar(
+            sample["continuation"],
+            name="continuation",
+            unit_interval=True,
+        )
+        episode_id = self._int32_scalar(sample["episode_id"], name="episode_id")
+        frame_index = self._int32_scalar(sample["frame_index"], name="frame_index")
+        return {
+            "observation": observation,
+            "executed_action": np.array(executed_action[0], copy=True),
+            "reward": reward,
+            "continuation": continuation,
+            "next_observation": next_observation,
+            "episode_id": episode_id,
+            "frame_index": frame_index,
+        }
+
+    def _transform_record(self, record: dict, *, name: str) -> tuple[dict, np.ndarray]:
+        if not isinstance(record, dict):
+            raise ValueError(f"{name} transition record must be a dictionary")
+        optional = {key: copy.deepcopy(record[key]) for key in self._OPTIONAL_FIELDS if key in record}
+        transformed = dict(self._pre_transform(copy.deepcopy(record)))
+        transformed.update(optional)
+        transformed = dict(self._transform(transformed))
+
+        for key in ("actions", "executed_actions", "action_history", "action_history_mask"):
+            if key not in transformed:
+                raise KeyError(f"transformed {name} transition record must contain {key}")
+        actions = self._real_floating_array(transformed["actions"], name=f"transformed {name} actions")
+        executed = self._real_floating_array(
+            transformed["executed_actions"],
+            name=f"transformed {name} executed_actions",
+        )
+        history = self._real_floating_array(
+            transformed["action_history"],
+            name=f"transformed {name} action_history",
+        )
+        history_mask = np.asarray(transformed["action_history_mask"])
+        if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[1] == 0:
+            raise ValueError(f"transformed {name} actions must have shape [time, action_dim]")
+        if executed.ndim != 2 or executed.shape[0] != 1 or executed.shape[1] == 0:
+            raise ValueError(f"transformed {name} executed_actions must have shape [1, action_dim]")
+        if actions.shape[1] != executed.shape[1] or actions.dtype != executed.dtype:
+            raise ValueError(f"transformed {name} actions and executed_actions must align in shape and dtype")
+        if history.ndim != 2 or history.shape[1] != executed.shape[1]:
+            raise ValueError(
+                f"transformed {name} action_history must have shape [history_length, action_dim]"
+            )
+        if history.dtype != executed.dtype:
+            raise ValueError(f"transformed {name} action history and executed action dtypes must match")
+        if history_mask.shape != (history.shape[0],) or not np.issubdtype(history_mask.dtype, np.bool_):
+            raise ValueError(f"transformed {name} action_history_mask must be boolean [history_length]")
+
+        observation = {
+            key: value
+            for key, value in transformed.items()
+            if key not in self._OBSERVATION_EXCLUSIONS
+        }
+        self._require_floating_leaves_finite(observation)
+        return observation, executed
+
+    @classmethod
+    def _validate_top_level(cls, sample: object) -> None:
+        if not isinstance(sample, dict) or set(sample) != cls._TOP_LEVEL_FIELDS:
+            raise ValueError(
+                "transition iterable samples must contain exactly current, next, reward, continuation, "
+                "episode_id, and frame_index"
+            )
+
+    @staticmethod
+    def _validate_batched_scalar_fields(sample: dict) -> None:
+        for name in ("reward", "continuation", "episode_id", "frame_index"):
+            value = np.asarray(sample[name])
+            if value.ndim != 1:
+                raise ValueError(f"batched transition {name} must be rank 1 [batch]")
+
+    @staticmethod
+    def _real_floating_array(value: object, *, name: str) -> np.ndarray:
+        array = np.asarray(value)
+        try:
+            floating = np.issubdtype(array.dtype, np.floating)
+        except TypeError:
+            floating = False
+        if not floating or not np.isrealobj(array):
+            raise ValueError(f"{name} must use a real floating dtype")
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} must contain only finite values")
+        return array
+
+    @classmethod
+    def _float32_scalar(
+        cls,
+        value: object,
+        *,
+        name: str,
+        unit_interval: bool = False,
+    ) -> np.float32:
+        array = cls._real_floating_array(value, name=name)
+        if array.ndim != 0:
+            raise ValueError(f"{name} must be a scalar")
+        original = array.item()
+        if unit_interval and not 0 <= original <= 1:
+            raise ValueError(f"{name} must be within [0, 1]")
+        with np.errstate(over="ignore", invalid="ignore"):
+            converted = np.float32(original)
+        if not np.isfinite(converted):
+            raise ValueError(f"{name} must remain finite when converted to float32")
+        if unit_interval and not 0 <= converted <= 1:
+            raise ValueError(f"{name} must remain within [0, 1] when converted to float32")
+        return converted
+
+    @staticmethod
+    def _int32_scalar(value: object, *, name: str) -> np.int32:
+        array = np.asarray(value)
+        if array.ndim != 0 or not np.issubdtype(array.dtype, np.integer):
+            raise ValueError(f"{name} must be an integer scalar")
+        integer = int(array.item())
+        bounds = np.iinfo(np.int32)
+        if not bounds.min <= integer <= bounds.max:
+            raise ValueError(f"{name} must fit in int32")
+        return np.int32(integer)
+
+    @classmethod
+    def _require_floating_leaves_finite(cls, tree: object) -> None:
+        if isinstance(tree, dict):
+            for value in tree.values():
+                cls._require_floating_leaves_finite(value)
+            return
+        if isinstance(tree, (tuple, list)):
+            for value in tree:
+                cls._require_floating_leaves_finite(value)
+            return
+        try:
+            array = np.asarray(tree)
+            inexact = np.issubdtype(array.dtype, np.inexact)
+        except (TypeError, ValueError):
+            return
+        if inexact and not np.all(np.isfinite(array)):
+            raise ValueError("transformed transition floating leaves must contain only finite values")
+
+
 class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples
@@ -459,6 +668,7 @@ def create_data_loader(
             sharding=sharding,
             shuffle=shuffle,
             num_batches=num_batches,
+            seed=config.seed,
             skip_norm_stats=skip_norm_stats,
             framework=framework,
         )
@@ -635,6 +845,7 @@ def create_rlds_data_loader(
     skip_norm_stats: bool = False,
     shuffle: bool = False,
     num_batches: int | None = None,
+    seed: int = 0,
     framework: str = "jax",
 ) -> DataLoader[TrainingBatch]:
     """Create an RLDS data loader for training.
@@ -653,6 +864,7 @@ def create_rlds_data_loader(
         num_batches: Determines the number of batches to return. If the number exceeds the
             number of batches in the dataset, the data loader will loop over the dataset.
             If not provided, will iterate over the dataset indefinitely.
+        seed: Seed forwarded to every RLDS sampling stream.
         framework: The framework to use ("jax" or "pytorch").
     """
     if framework == "pytorch":
@@ -660,14 +872,20 @@ def create_rlds_data_loader(
             "PyTorch RLDS data loader is not supported yet")
 
     dataset_class = CONFIG_NAME[config_name]
-    paired_enabled = bool(getattr(model_config, "chunkflow_supervised_enabled", False))
-    if paired_enabled and not bool(getattr(dataset_class, "supports_chunkflow_pairs", False)):
+    supervised_enabled = bool(getattr(model_config, "chunkflow_supervised_enabled", False))
+    awac_enabled = bool(getattr(model_config, "awac_enable", False))
+    training_enabled = bool(getattr(model_config, "chunkflow_training_enabled", False))
+    pairs_required = supervised_enabled or awac_enabled
+    if pairs_required and not bool(getattr(dataset_class, "supports_chunkflow_pairs", False)):
         raise NotImplementedError(
-            f"{dataset_class.__name__} does not provide episode-aware paired chunks required by ChunkFlow"
+            f"{dataset_class.__name__} does not support episode-aware paired chunks required by ChunkFlow"
+        )
+    if awac_enabled and not bool(getattr(dataset_class, "supports_chunkflow_transitions", False)):
+        raise NotImplementedError(
+            f"{dataset_class.__name__} does not support strict episode-aware transitions required by AWAC"
         )
 
-    # 准备基础参数
-    dataset_kwargs = {
+    base_dataset_kwargs = {
         "repo_id": data_config.repo_id,
         "data_dir": data_config.rlds_data_dir,
         "batch_size": batch_size,
@@ -676,21 +894,20 @@ def create_rlds_data_loader(
         "action_space": data_config.action_space,
         "filter_dict_path": data_config.filter_dict_path,
     }
-    if paired_enabled:
-        dataset_kwargs.update(
-            chunkflow_stride=int(
-                getattr(
-                    model_config,
-                    "chunk_stride",
-                    action_horizon - int(getattr(model_config, "overlap_O", 0)),
-                )
-            ),
-            history_length=int(getattr(model_config, "history_length", 0)),
+    if dataset_class in (DroidRldsDataset, DroidRldsNewDataset):
+        base_dataset_kwargs.pop("repo_id")
+    stride = int(
+        getattr(
+            model_config,
+            "chunk_stride",
+            action_horizon - int(getattr(model_config, "overlap_O", 0)),
         )
+    )
+    history_length = int(getattr(model_config, "history_length", 0))
 
     # Add this option only for dataset implementations that support it.
     if dataset_class == TruthRldsDatasetCartesian:
-        dataset_kwargs["downsampled_and_repeated"] = data_config.downsampled_and_repeated
+        base_dataset_kwargs["downsampled_and_repeated"] = data_config.downsampled_and_repeated
         if dataset_class == TruthRldsDatasetCartesian:
             logging.info(
                 "data_config.downsampled_and_repeated: %s", data_config.downsampled_and_repeated
@@ -707,33 +924,66 @@ def create_rlds_data_loader(
     }
     logging.info("Creating %s data loader", dataset_type_names.get(dataset_class, "RLDS"))
 
-    # 创建数据集
-    dataset = dataset_class(**dataset_kwargs)
-
-    # 应用数据转换。配对样本的两个 record 必须独立走同一条坐标变换链。
-    if paired_enabled:
-        pre_transforms, transforms = _input_transforms(
-            data_config, skip_norm_stats=skip_norm_stats
-        )
-        dataset = IterablePairedTransformedDataset(
-            dataset,
-            pre_transforms=pre_transforms,
-            transforms=transforms,
-            is_batched=True,
-        )
-    else:
-        dataset = transform_iterable_dataset(
-            dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True
-        )
-
-    # 创建数据加载器
-    data_loader = RLDSDataLoader(
-        dataset,
-        sharding=sharding,
-        num_batches=num_batches,
+    supports_strict_modes = bool(
+        getattr(dataset_class, "supports_chunkflow_pairs", False)
+        or getattr(dataset_class, "supports_chunkflow_transitions", False)
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    def build_raw_dataset(mode: Literal["legacy", "paired", "transition"], stream_seed: int):
+        dataset_kwargs = dict(base_dataset_kwargs)
+        if supports_strict_modes:
+            dataset_kwargs.update(
+                chunkflow_mode=mode,
+                chunkflow_stride=stride if mode != "legacy" else None,
+                history_length=history_length,
+                seed=stream_seed,
+            )
+        return dataset_class(**dataset_kwargs)
+
+    def build_stream_loader(dataset: IterableDataset) -> DataLoaderImpl:
+        return DataLoaderImpl(
+            data_config,
+            RLDSDataLoader(
+                dataset,
+                sharding=sharding,
+                num_batches=num_batches,
+            ),
+        )
+
+    if not training_enabled:
+        legacy_dataset = transform_iterable_dataset(
+            build_raw_dataset("legacy", seed),
+            data_config,
+            skip_norm_stats=skip_norm_stats,
+            is_batched=True,
+        )
+        return build_stream_loader(legacy_dataset)
+
+    pre_transforms, transforms = _input_transforms(
+        data_config, skip_norm_stats=skip_norm_stats
+    )
+    paired_dataset = IterablePairedTransformedDataset(
+        build_raw_dataset("paired", seed),
+        pre_transforms=pre_transforms,
+        transforms=transforms,
+        is_batched=True,
+    )
+    supervised_loader = build_stream_loader(paired_dataset)
+    if not awac_enabled:
+        return supervised_loader
+
+    transition_dataset = IterableTransitionTransformedDataset(
+        build_raw_dataset("transition", seed + 1),
+        pre_transforms=pre_transforms,
+        transforms=transforms,
+        is_batched=True,
+    )
+    transition_loader = build_stream_loader(transition_dataset)
+    return CompositeDataLoader(
+        data_config,
+        supervised_loader,
+        transition_loader,
+    )
 
 
 class TorchDataLoader:

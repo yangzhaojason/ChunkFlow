@@ -1,4 +1,6 @@
+import copy
 import dataclasses
+import inspect
 
 import jax
 import numpy as np
@@ -483,3 +485,298 @@ def test_rlds_loader_rejects_an_empty_dataset_without_spinning():
 
     with pytest.raises(RuntimeError, match="produced no batches"):
         next(iter(loader))
+
+
+def test_exact_rlds_chunkflow_capabilities_and_constructor_modes():
+    supported = (
+        _data_loader.TruthRldsDatasetJointWithoutGripper,
+        _data_loader.DroidRldsDataset,
+        _data_loader.DroidRldsNewDataset,
+    )
+    unsupported = (_data_loader.TruthRldsDataset, _data_loader.TruthRldsDatasetCartesian)
+
+    for dataset_class in supported:
+        assert dataset_class.supports_chunkflow_pairs is True
+        assert dataset_class.supports_chunkflow_transitions is True
+        parameters = inspect.signature(dataset_class).parameters
+        assert parameters["chunkflow_mode"].default == "legacy"
+        assert parameters["chunkflow_stride"].default is None
+        assert parameters["history_length"].default == 0
+        assert parameters["seed"].default == 0
+    for dataset_class in unsupported:
+        assert not hasattr(dataset_class, "supports_chunkflow_pairs")
+        assert not hasattr(dataset_class, "supports_chunkflow_transitions")
+
+
+def test_truth_strict_mode_record_is_built_in_supported_adapter_only():
+    supported_source = inspect.getsource(_data_loader.TruthRldsDatasetJointWithoutGripper)
+    legacy_source = inspect.getsource(_data_loader.TruthRldsDataset)
+
+    record_index = supported_source.index("record = {")
+    legacy_return_index = supported_source.index(
+        'if chunkflow_mode == "legacy":\n                return record'
+    )
+    assert record_index < legacy_return_index
+    assert "record = {" not in legacy_source
+    assert "chunkflow_mode" not in legacy_source
+
+
+@pytest.mark.parametrize(
+    ("supports_pairs", "supports_transitions", "message"),
+    [(False, False, "paired chunks"), (True, False, "transitions")],
+)
+def test_rlds_loader_rejects_missing_capability_before_construction(
+    monkeypatch, supports_pairs, supports_transitions, message
+):
+    constructed = False
+
+    class _CapabilityDataset:
+        supports_chunkflow_pairs = supports_pairs
+        supports_chunkflow_transitions = supports_transitions
+
+        def __init__(self, **kwargs):
+            nonlocal constructed
+            del kwargs
+            constructed = True
+
+    monkeypatch.setitem(_data_loader.CONFIG_NAME, "capability-test", _CapabilityDataset)
+
+    with pytest.raises(NotImplementedError, match=message):
+        _data_loader.create_rlds_data_loader(
+            config_name="capability-test",
+            data_config=_config.DataConfig(repo_id="test", rlds_data_dir="/tmp/test"),
+            model_config=pi0_config.Pi0Config(action_horizon=4, overlap_O=2, awac_enable=True),
+            action_horizon=4,
+            batch_size=2,
+            skip_norm_stats=True,
+            seed=7,
+        )
+
+    assert constructed is False
+
+
+def _capture_rlds_pipeline(monkeypatch):
+    constructor_kwargs = []
+    wrapped = []
+
+    class _StrictRldsDataset:
+        supports_chunkflow_pairs = True
+        supports_chunkflow_transitions = True
+
+        def __init__(self, **kwargs):
+            constructor_kwargs.append(kwargs)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 1
+
+    class _CapturingRldsLoader:
+        def __init__(self, dataset, **kwargs):
+            wrapped.append((dataset, kwargs))
+
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setitem(_data_loader.CONFIG_NAME, "strict-test", _StrictRldsDataset)
+    monkeypatch.setattr(_data_loader, "RLDSDataLoader", _CapturingRldsLoader)
+    return constructor_kwargs, wrapped
+
+
+def test_rlds_awac_builds_independent_paired_and_transition_streams(monkeypatch):
+    constructor_kwargs, wrapped = _capture_rlds_pipeline(monkeypatch)
+    model_config = pi0_config.Pi0Config(
+        action_horizon=4,
+        overlap_O=2,
+        history_length=1,
+        awac_enable=True,
+    )
+
+    loader = _data_loader.create_rlds_data_loader(
+        config_name="strict-test",
+        data_config=_config.DataConfig(repo_id="test", rlds_data_dir="/tmp/test"),
+        model_config=model_config,
+        action_horizon=4,
+        batch_size=2,
+        num_batches=3,
+        skip_norm_stats=True,
+        seed=7,
+    )
+
+    assert isinstance(loader, _data_loader.CompositeDataLoader)
+    assert [(kwargs["chunkflow_mode"], kwargs["seed"]) for kwargs in constructor_kwargs] == [
+        ("paired", 7),
+        ("transition", 8),
+    ]
+    assert all(kwargs["chunkflow_stride"] == 2 for kwargs in constructor_kwargs)
+    assert all(kwargs["history_length"] == 1 for kwargs in constructor_kwargs)
+    assert all(kwargs["action_chunk_size"] == 4 for kwargs in constructor_kwargs)
+    assert isinstance(wrapped[0][0], _data_loader.IterablePairedTransformedDataset)
+    assert isinstance(wrapped[1][0], _data_loader.IterableTransitionTransformedDataset)
+    assert [kwargs["num_batches"] for _, kwargs in wrapped] == [3, 3]
+
+
+def test_rlds_supervised_only_builds_one_seeded_paired_stream(monkeypatch):
+    constructor_kwargs, wrapped = _capture_rlds_pipeline(monkeypatch)
+
+    loader = _data_loader.create_rlds_data_loader(
+        config_name="strict-test",
+        data_config=_config.DataConfig(repo_id="test", rlds_data_dir="/tmp/test"),
+        model_config=pi0_config.Pi0Config(action_horizon=4, overlap_O=2, history_length=1),
+        action_horizon=4,
+        batch_size=2,
+        skip_norm_stats=True,
+        seed=7,
+    )
+
+    assert isinstance(loader, _data_loader.DataLoaderImpl)
+    assert [(kwargs["chunkflow_mode"], kwargs["seed"]) for kwargs in constructor_kwargs] == [("paired", 7)]
+    assert len(wrapped) == 1
+    assert isinstance(wrapped[0][0], _data_loader.IterablePairedTransformedDataset)
+
+
+def test_rlds_legacy_builds_one_seeded_legacy_stream(monkeypatch):
+    constructor_kwargs, wrapped = _capture_rlds_pipeline(monkeypatch)
+
+    loader = _data_loader.create_rlds_data_loader(
+        config_name="strict-test",
+        data_config=_config.DataConfig(repo_id="test", rlds_data_dir="/tmp/test"),
+        model_config=pi0_config.Pi0Config(action_horizon=4),
+        action_horizon=4,
+        batch_size=2,
+        skip_norm_stats=True,
+        seed=7,
+    )
+
+    assert isinstance(loader, _data_loader.DataLoaderImpl)
+    assert [(kwargs["chunkflow_mode"], kwargs["seed"]) for kwargs in constructor_kwargs] == [("legacy", 7)]
+    assert len(wrapped) == 1
+    assert isinstance(wrapped[0][0], _data_loader.IterableTransformedDataset)
+
+
+class _SingleBatchedTransitionDataset:
+    def __iter__(self):
+        yield {
+            "current": {
+                "raw_state": np.array([[7.0]], dtype=np.float32),
+                "raw_actions": np.array([[[8.0]]], dtype=np.float32),
+                "executed_actions": np.array([[[9.0]]], dtype=np.float32),
+                "action_history": np.array([[[0.0], [6.0]]], dtype=np.float32),
+                "action_history_mask": np.array([[False, True]]),
+            },
+            "next": {
+                "raw_state": np.array([[8.0]], dtype=np.float32),
+                "raw_actions": np.array([[[9.0]]], dtype=np.float32),
+                "executed_actions": np.array([[[10.0]]], dtype=np.float32),
+                "action_history": np.array([[[6.0], [9.0]]], dtype=np.float32),
+                "action_history_mask": np.array([[True, True]]),
+            },
+            "reward": np.array([1.0], dtype=np.float32),
+            "continuation": np.array([0.0], dtype=np.float32),
+            "episode_id": np.array([12], dtype=np.int32),
+            "frame_index": np.array([3], dtype=np.int32),
+        }
+
+    def __len__(self):
+        return 1
+
+
+def test_iterable_transition_transform_emits_strict_batched_contract():
+    dataset = _data_loader.IterableTransitionTransformedDataset(
+        _SingleBatchedTransitionDataset(),
+        pre_transforms=[_transforms.RepackTransform({"state": "raw_state", "actions": "raw_actions"})],
+        transforms=[_transforms.DeltaActions(mask=[True])],
+        is_batched=True,
+    )
+
+    batch = next(iter(dataset))
+
+    assert set(batch) == {
+        "observation",
+        "executed_action",
+        "reward",
+        "continuation",
+        "next_observation",
+        "episode_id",
+        "frame_index",
+    }
+    assert "actions" not in batch["observation"]
+    assert "actions" not in batch["next_observation"]
+    np.testing.assert_array_equal(batch["executed_action"], [[2.0]])
+    np.testing.assert_array_equal(batch["observation"]["action_history"], [[[0.0], [-1.0]]])
+    np.testing.assert_array_equal(batch["next_observation"]["action_history"], [[[-2.0], [1.0]]])
+    assert batch["reward"].dtype == np.float32
+    assert batch["continuation"].dtype == np.float32
+    assert batch["episode_id"].dtype == np.int32
+    assert batch["frame_index"].dtype == np.int32
+    assert batch["executed_action"].shape == (1, 1)
+
+
+class _OneBatchedTransition:
+    def __init__(self, sample):
+        self._sample = sample
+
+    def __iter__(self):
+        yield self._sample
+
+    def __len__(self):
+        return 1
+
+
+def _batched_transition_sample():
+    return copy.deepcopy(next(iter(_SingleBatchedTransitionDataset())))
+
+
+def test_iterable_transition_transform_requires_exact_top_level_contract():
+    sample = _batched_transition_sample()
+    sample.pop("reward")
+    dataset = _data_loader.IterableTransitionTransformedDataset(
+        _OneBatchedTransition(sample),
+        pre_transforms=[_transforms.RepackTransform({"state": "raw_state", "actions": "raw_actions"})],
+        is_batched=True,
+    )
+
+    with pytest.raises(ValueError, match="exactly"):
+        next(iter(dataset))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("reward", np.array([1], dtype=np.int32), "floating"),
+        ("reward", np.array([np.inf], dtype=np.float32), "finite"),
+        ("reward", np.array([[1.0]], dtype=np.float32), "rank 1"),
+        ("continuation", np.array([1.1], dtype=np.float32), r"\[0, 1\]"),
+        ("continuation", np.array([1.0 + 1e-12], dtype=np.float64), r"\[0, 1\]"),
+        ("episode_id", np.array([1.0], dtype=np.float32), "integer"),
+    ],
+)
+def test_iterable_transition_transform_rejects_invalid_scalars(field, value, message):
+    sample = _batched_transition_sample()
+    sample[field] = value
+    dataset = _data_loader.IterableTransitionTransformedDataset(
+        _OneBatchedTransition(sample),
+        pre_transforms=[_transforms.RepackTransform({"state": "raw_state", "actions": "raw_actions"})],
+        is_batched=True,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        next(iter(dataset))
+
+
+def test_create_data_loader_forwards_seed_to_rlds(monkeypatch):
+    captured = {}
+    config = dataclasses.replace(_config.get_config("debug"), seed=19)
+    data_config = dataclasses.replace(config.data.create(config.assets_dirs, config.model), rlds_data_dir="/tmp/test")
+    monkeypatch.setattr(type(config.data), "create", lambda self, assets_dirs, model: data_config)
+
+    def fake_create_rlds_data_loader(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_data_loader, "create_rlds_data_loader", fake_create_rlds_data_loader)
+
+    _data_loader.create_data_loader(config, skip_norm_stats=True)
+
+    assert captured["seed"] == 19
