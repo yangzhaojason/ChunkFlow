@@ -53,7 +53,7 @@ For the same reason, `kl_beta * reference_consistency` is the explicit Equation 
 
 The target V parameters follow an EMA of the updated online V parameters. This is a numerical-stability extension to Equation (12), not a claim about an additional paper equation. Exact flow entropy is unsupported; any nonzero `entropy_lambda` is rejected rather than silently ignored.
 
-The reported actor objective retains the full supervised chunk loss and structural terms while adding the weighted first-action surrogate and reference consistency. Q and V have a separate optimizer objective. Their features are stop-gradient actor features, and the critic is omitted from inference.
+Equation (15) maps to the retained full-chunk structural regularization: first-order total variation/continuity, second-order curvature, and stopped adjacent-chunk boundary alignment. The full supervised flow/BC loss remains alongside those Equation (15) terms as the imitation anchor; it is not presented here as mathematically part of Equation (15). The reported actor objective also adds the weighted first-action surrogate and reference consistency. Q and V have a separate optimizer objective. Their features are stop-gradient actor features, and the critic is omitted from inference.
 
 ## Canonical paper configuration
 
