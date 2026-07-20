@@ -259,6 +259,10 @@ class StepTransitionDataset:
         reward = self._scalar(current_raw, self._reward_key)
         continuation = self._scalar(current_raw, self._continuation_key)
         self._validate_reward_and_continuation(reward, continuation)
+        with np.errstate(over="ignore", invalid="ignore"):
+            converted_reward = np.float32(reward)
+            converted_continuation = np.float32(continuation)
+        self._validate_reward_and_continuation(converted_reward, converted_continuation)
         history, history_mask = self._history_before(record_index, executed)
 
         next_index = self._record_lookup.get((episode, frame + 1))
@@ -299,8 +303,8 @@ class StepTransitionDataset:
         return {
             "observation": observation,
             "executed_action": transformed_executed,
-            "reward": np.float32(reward),
-            "continuation": np.float32(continuation),
+            "reward": converted_reward,
+            "continuation": converted_continuation,
             "next_observation": next_observation,
             "episode_id": np.int32(episode),
             "frame_index": np.int32(frame),

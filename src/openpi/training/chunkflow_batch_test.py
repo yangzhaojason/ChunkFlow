@@ -308,6 +308,37 @@ def test_step_transition_normalizes_float64_scalar_fields_to_float32():
 
 
 @pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "reward",
+            np.float64(np.finfo(np.float32).max) * 2.0,
+            r"reward.*finite",
+        ),
+        (
+            "cont",
+            np.array([np.float64(np.finfo(np.float32).max) * 2.0]),
+            r"cont.*within",
+        ),
+    ],
+)
+def test_step_transition_rejects_float64_scalars_above_float32_range(field, value, message):
+    records = _transition_records()
+    records[0][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        _step_transition_dataset(records)[0]
+
+
+def test_step_transition_validates_continuation_range_before_float32_conversion():
+    records = _transition_records()
+    records[0]["cont"] = np.nextafter(np.float64(1.0), np.float64(np.inf))
+
+    with pytest.raises(ValueError, match=r"cont.*within"):
+        _step_transition_dataset(records)[0]
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("reward", np.array([1.0, 2.0])),
