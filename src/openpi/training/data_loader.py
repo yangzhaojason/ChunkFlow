@@ -652,6 +652,9 @@ def create_data_loader(
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
     """
+    if framework == "pytorch" and bool(getattr(config.model, "awac_enable", False)):
+        raise NotImplementedError("ChunkFlow AWAC training is supported only by the JAX trainer")
+
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
@@ -719,6 +722,9 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
+    if framework == "pytorch" and bool(getattr(model_config, "awac_enable", False)):
+        raise NotImplementedError("ChunkFlow AWAC training is supported only by the JAX trainer")
+
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
 
     def _build_torch_stream_loader(

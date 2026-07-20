@@ -292,28 +292,47 @@ def test_supervised_only_chunkflow_pytorch_ddp_preserves_default_sampler_seed(mo
     assert stream_seeds == [7]
 
 
-def test_chunkflow_awac_pytorch_ddp_uses_independent_sampler_and_stream_seeds(monkeypatch):
-    sampler_seeds, stream_seeds = _capture_pytorch_ddp_seeds(monkeypatch)
+def test_direct_pytorch_loader_rejects_awac_before_dataset_construction(monkeypatch):
     model_config = pi0_config.Pi0Config(action_horizon=4, overlap_O=2, awac_enable=True)
+    message = "ChunkFlow AWAC training is supported only by the JAX trainer"
 
-    loader = _data_loader.create_torch_data_loader(
-        _config.DataConfig(
-            repo_id="fake",
-            awac_executed_action_key="executed_actions",
-            awac_reward_key="rewards",
-            awac_continuation_key="discounts",
-        ),
-        model_config=model_config,
-        action_horizon=4,
-        batch_size=2,
-        framework="pytorch",
-        seed=7,
-        skip_norm_stats=True,
+    def fail_dataset_construction(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("AWAC PyTorch guard must run before dataset construction")
+
+    monkeypatch.setattr(_data_loader, "create_torch_dataset", fail_dataset_construction)
+
+    with pytest.raises(NotImplementedError) as exc_info:
+        _data_loader.create_torch_data_loader(
+            _config.DataConfig(repo_id="fake"),
+            model_config=model_config,
+            action_horizon=4,
+            batch_size=2,
+            framework="pytorch",
+            skip_norm_stats=True,
+        )
+
+    assert str(exc_info.value) == message
+
+
+def test_pytorch_loader_rejects_awac_before_data_config_construction(monkeypatch):
+    config = _config.get_config("debug_pi05")
+    config = dataclasses.replace(
+        config,
+        model=dataclasses.replace(config.model, awac_enable=True),
     )
+    message = "ChunkFlow AWAC training is supported only by the JAX trainer"
 
-    assert isinstance(loader, _data_loader.CompositeDataLoader)
-    assert sampler_seeds == [7, 8]
-    assert stream_seeds == [7, 8]
+    def fail_data_config_construction(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("AWAC PyTorch guard must run before data config construction")
+
+    monkeypatch.setattr(type(config.data), "create", fail_data_config_construction)
+
+    with pytest.raises(NotImplementedError) as exc_info:
+        _data_loader.create_data_loader(config, framework="pytorch")
+
+    assert str(exc_info.value) == message
 
 
 def test_transition_fake_dataset_fields_are_awac_only_and_terminal_discount_is_zero():

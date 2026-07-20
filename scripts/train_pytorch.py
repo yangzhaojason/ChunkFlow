@@ -134,6 +134,9 @@ def set_seed(seed: int, local_rank: int):
 
 def build_datasets(config: _config.TrainConfig):
     """构建 PyTorch 数据加载器并返回 (loader, data_config)。"""
+    if bool(getattr(config.model, "awac_enable", False)):
+        raise NotImplementedError("ChunkFlow AWAC training is supported only by the JAX trainer")
+
     # 使用统一数据加载器（PyTorch 框架）
     data_loader = _data.create_data_loader(
         config, framework="pytorch", shuffle=True)

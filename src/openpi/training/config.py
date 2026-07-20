@@ -36,6 +36,14 @@ CHUNKFLOW_REAL_DATA_DIR = os.environ.get("CHUNKFLOW_REAL_DATA_DIR", "datasets/re
 CHUNKFLOW_PI05_BASE_CHECKPOINT = os.environ.get(
     "CHUNKFLOW_PI05_BASE_CHECKPOINT", "gs://openpi-assets/checkpoints/pi05_base/params"
 )
+CHUNKFLOW_PAPER_REPO_ID = os.environ.get("CHUNKFLOW_PAPER_REPO_ID", "chunkflow/libero")
+CHUNKFLOW_PAPER_DATASET_ROOT = os.environ.get(
+    "CHUNKFLOW_PAPER_DATASET_ROOT", "datasets/chunkflow_lerobot"
+)
+CHUNKFLOW_SUPERVISED_CHECKPOINT = os.environ.get(
+    "CHUNKFLOW_SUPERVISED_CHECKPOINT",
+    "checkpoints/pi05_chunkflow_paper_bc/chunkflow_bc/29999/params",
+)
 CHUNKFLOW_REAL_JOINT_STAGE1_CHECKPOINT = os.environ.get(
     "CHUNKFLOW_REAL_JOINT_STAGE1_CHECKPOINT", "checkpoints/chunkflow_real_joint_stage1/params"
 )
@@ -974,6 +982,89 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             CHUNKFLOW_PI05_BASE_CHECKPOINT),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_chunkflow_paper_bc",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            overlap_O=8,
+            history_length=4,
+            continuity_first_order_weight=0.005,
+            continuity_second_order_weight=0.005,
+            boundary_weight=0.03,
+            history_noise_std=0.0,
+            history_dropout_probability=0.0,
+            history_schedule_max_alpha=0.0,
+            awac_enable=False,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id=CHUNKFLOW_PAPER_REPO_ID,
+            lerobot_root=CHUNKFLOW_PAPER_DATASET_ROOT,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                awac_executed_action_key="actions",
+                awac_reward_key="rewards",
+                awac_continuation_key="discounts",
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(CHUNKFLOW_PI05_BASE_CHECKPOINT),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_chunkflow_paper_awac",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            overlap_O=8,
+            history_length=4,
+            continuity_first_order_weight=0.005,
+            continuity_second_order_weight=0.005,
+            boundary_weight=0.03,
+            history_noise_std=0.0,
+            history_dropout_probability=0.0,
+            history_schedule_max_alpha=0.0,
+            awac_enable=True,
+            awac_gamma=0.99,
+            awac_expectile_tau_e=0.7,
+            awac_temperature_tau=0.05,
+            awac_wmax=20.0,
+            kl_beta=2e-4,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id=CHUNKFLOW_PAPER_REPO_ID,
+            lerobot_root=CHUNKFLOW_PAPER_DATASET_ROOT,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                awac_executed_action_key="actions",
+                awac_reward_key="rewards",
+                awac_continuation_key="discounts",
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(CHUNKFLOW_SUPERVISED_CHECKPOINT),
         num_train_steps=30_000,
     ),
     #
