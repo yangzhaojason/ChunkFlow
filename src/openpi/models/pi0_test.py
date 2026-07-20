@@ -455,6 +455,122 @@ def test_history_configuration_is_validated(kwargs, match):
         _pi0_config.Pi0Config(**kwargs)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"awac_expectile_tau_e": 0.0},
+        {"awac_temperature_tau": 0.0},
+        {"awac_wmax": 0.9},
+        {"awac_gamma": 1.1},
+        {"awac_critic_hidden_width": 0},
+        {"awac_critic_depth": 0},
+        {"awac_target_decay": 1.0},
+        {"kl_beta": -1.0},
+    ],
+)
+def test_awac_configuration_rejects_invalid_values(kwargs):
+    with pytest.raises(ValueError, match=r"awac|kl_beta"):
+        _pi0_config.Pi0Config(**kwargs)
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None, jnp.bool_(1)])
+def test_awac_configuration_requires_exact_boolean_enable(value):
+    with pytest.raises(ValueError, match="awac_enable"):
+        _pi0_config.Pi0Config(awac_enable=value)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "awac_gamma",
+        "awac_expectile_tau_e",
+        "awac_temperature_tau",
+        "awac_wmax",
+        "awac_actor_weight",
+        "awac_q_weight",
+        "awac_v_weight",
+        "awac_target_decay",
+        "kl_beta",
+        "entropy_lambda",
+    ],
+)
+@pytest.mark.parametrize("value", [True, "not-real", float("inf"), float("-inf"), float("nan")])
+def test_awac_configuration_rejects_non_finite_or_non_real_scalars(field, value):
+    with pytest.raises(ValueError, match=field):
+        _pi0_config.Pi0Config(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["awac_actor_weight", "awac_q_weight", "awac_v_weight", "kl_beta"])
+def test_awac_configuration_rejects_negative_loss_weights(field):
+    with pytest.raises(ValueError, match=field):
+        _pi0_config.Pi0Config(**{field: -0.1})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("awac_gamma", -0.1),
+        ("awac_expectile_tau_e", 1.0),
+        ("awac_temperature_tau", -0.1),
+        ("awac_target_decay", -0.1),
+        ("entropy_lambda", -0.1),
+        ("entropy_lambda", 0.1),
+    ],
+)
+def test_awac_configuration_rejects_out_of_range_scalars(field, value):
+    with pytest.raises(ValueError, match=field):
+        _pi0_config.Pi0Config(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["awac_critic_hidden_width", "awac_critic_depth"])
+@pytest.mark.parametrize("value", [True, -1, 1.5])
+def test_awac_configuration_requires_positive_integer_critic_dimensions(field, value):
+    with pytest.raises(ValueError, match=field):
+        _pi0_config.Pi0Config(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"awac_gamma": 0.0},
+        {"awac_gamma": 1.0},
+        {"awac_wmax": 1.0},
+        {"awac_target_decay": 0.0},
+        {
+            "awac_actor_weight": 0.0,
+            "awac_q_weight": 0.0,
+            "awac_v_weight": 0.0,
+            "kl_beta": 0.0,
+        },
+    ],
+)
+def test_awac_configuration_accepts_inclusive_boundaries(kwargs):
+    _pi0_config.Pi0Config(**kwargs)
+
+
+def test_awac_configuration_exposes_chunkflow_training_without_supervision():
+    disabled = _pi0_config.Pi0Config()
+    awac_enabled = _pi0_config.Pi0Config(awac_enable=True)
+    supervised = _pi0_config.Pi0Config(history_length=1)
+
+    assert not disabled.chunkflow_training_enabled
+    assert not awac_enabled.chunkflow_supervised_enabled
+    assert awac_enabled.chunkflow_training_enabled
+    assert supervised.chunkflow_training_enabled
+
+
+def test_awac_configuration_does_not_attach_critic_to_pi0_state():
+    disabled_model = nnx.eval_shape(_pi0_config.Pi0Config().create, jax.random.key(0))
+    awac_model = nnx.eval_shape(
+        _pi0_config.Pi0Config(awac_enable=True).create,
+        jax.random.key(0),
+    )
+    disabled_paths = set(nnx.state(disabled_model).flat_state())
+    awac_paths = set(nnx.state(awac_model).flat_state())
+
+    assert awac_paths == disabled_paths
+
+
 def test_chunkflow_supervision_properties():
     disabled = _pi0_config.Pi0Config(action_horizon=8, overlap_O=2)
     history_enabled = _pi0_config.Pi0Config(action_horizon=8, overlap_O=2, history_length=3)

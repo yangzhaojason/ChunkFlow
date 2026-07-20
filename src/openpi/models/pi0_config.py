@@ -42,6 +42,16 @@ if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
 
 
+def _finite_real(value: object, *, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, numbers.Real)
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(f"{name} must be a finite real number")
+    return float(value)
+
+
 # 使用冻结（frozen=True）的 dataclass，确保配置对象不可变
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
@@ -99,6 +109,9 @@ class Pi0Config(_model.BaseModelConfig):
     awac_actor_weight: float = 1.0
     awac_q_weight: float = 1.0
     awac_v_weight: float = 1.0
+    awac_critic_hidden_width: int = 512
+    awac_critic_depth: int = 2
+    awac_target_decay: float = 0.995
     kl_beta: float = 0.0
     entropy_lambda: float = 0.0
 
@@ -168,12 +181,54 @@ class Pi0Config(_model.BaseModelConfig):
                 or not 0 <= value <= 1
             ):
                 raise ValueError(f"{name} must be finite and within [0, 1]")
-        if self.entropy_lambda != 0:
-            raise ValueError("entropy regularization is unsupported for ChunkFlow AWAC")
+
+        if not isinstance(self.awac_enable, bool):
+            raise ValueError("awac_enable must be a bool")
+        for name in ("awac_critic_hidden_width", "awac_critic_depth"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+        awac_scalars = {
+            name: _finite_real(getattr(self, name), name=name)
+            for name in (
+                "awac_gamma",
+                "awac_expectile_tau_e",
+                "awac_temperature_tau",
+                "awac_wmax",
+                "awac_actor_weight",
+                "awac_q_weight",
+                "awac_v_weight",
+                "awac_target_decay",
+                "kl_beta",
+                "entropy_lambda",
+            )
+        }
+        for name in ("awac_actor_weight", "awac_q_weight", "awac_v_weight", "kl_beta"):
+            if awac_scalars[name] < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if not 0 <= awac_scalars["awac_gamma"] <= 1:
+            raise ValueError("awac_gamma must be within [0, 1]")
+        if not 0 < awac_scalars["awac_expectile_tau_e"] < 1:
+            raise ValueError("awac_expectile_tau_e must be within (0, 1)")
+        if awac_scalars["awac_temperature_tau"] <= 0:
+            raise ValueError("awac_temperature_tau must be positive")
+        if awac_scalars["awac_wmax"] < 1:
+            raise ValueError("awac_wmax must be at least 1")
+        if not 0 <= awac_scalars["awac_target_decay"] < 1:
+            raise ValueError("awac_target_decay must be within [0, 1)")
+        if awac_scalars["entropy_lambda"] != 0:
+            raise ValueError(
+                "entropy_lambda must be zero; entropy regularization is unsupported for ChunkFlow AWAC"
+            )
 
     @property
     def chunkflow_supervised_enabled(self) -> bool:
         return self.history_length > 0 or self.boundary_weight > 0
+
+    @property
+    def chunkflow_training_enabled(self) -> bool:
+        return self.chunkflow_supervised_enabled or self.awac_enable
 
     @property
     def chunk_stride(self) -> int:
