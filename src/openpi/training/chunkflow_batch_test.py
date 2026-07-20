@@ -104,6 +104,16 @@ class _ListDataset:
         return len(self.records)
 
 
+class _CountingDataset(_ListDataset):
+    def __init__(self, records):
+        super().__init__(records)
+        self.read_counts = np.zeros((len(records),), dtype=np.int64)
+
+    def __getitem__(self, index):
+        self.read_counts[index] += 1
+        return super().__getitem__(index)
+
+
 def test_paired_transformed_dataset_attaches_raw_history_before_action_transforms():
     records = [
         {
@@ -232,6 +242,70 @@ def test_paired_dataset_history_can_span_multiple_strides():
     item = dataset[0]
     np.testing.assert_array_equal(item["observation"]["action_history"][:, 0], [0.0, 0.0, 0.0, 1.0])
     np.testing.assert_array_equal(item["observation"]["action_history_mask"], [False, False, True, True])
+
+
+@pytest.mark.parametrize(
+    ("horizons", "stride", "history_length", "message"),
+    [
+        ((4, 6), 5, 4, r"stride.*horizon"),
+        ((6, 4), 5, 4, r"stride.*horizon"),
+        ((4, 6), 2, 5, r"history_length.*horizon"),
+        ((6, 4), 2, 5, r"history_length.*horizon"),
+    ],
+)
+def test_paired_dataset_validates_runtime_action_horizon_for_each_pair_record(
+    horizons, stride, history_length, message
+):
+    records = [
+        {
+            "state": np.array([frame], dtype=np.float32),
+            "actions": np.arange(horizon, dtype=np.float32)[:, None],
+        }
+        for frame, horizon in zip((0, stride), horizons, strict=True)
+    ]
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(2, dtype=np.int64),
+        frame_indices=np.array([0, stride]),
+        stride=stride,
+        history_length=history_length,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        dataset[0]
+
+
+def test_paired_dataset_caches_each_canonical_history_source_per_item():
+    records = [
+        {
+            "frame": frame,
+            "state": np.array([frame], dtype=np.float32),
+            "actions": np.arange(frame, frame + 10, dtype=np.float32)[:, None],
+        }
+        for frame in range(7)
+    ]
+    source = _CountingDataset(records)
+    pre_transform_counts = np.zeros((len(records),), dtype=np.int64)
+
+    def count_pre_transform(record):
+        pre_transform_counts[record["frame"]] += 1
+        return record
+
+    dataset = PairedTransformedDataset(
+        source,
+        episode_ids=np.zeros(len(records), dtype=np.int64),
+        frame_indices=np.arange(len(records)),
+        stride=2,
+        history_length=4,
+        pre_transforms=[count_pre_transform],
+    )
+
+    item = dataset[2]
+
+    np.testing.assert_array_equal(item["previous_observation"]["action_history"][:, 0], [0.0, 1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(item["observation"]["action_history"][:, 0], [2.0, 3.0, 4.0, 5.0])
+    np.testing.assert_array_equal(source.read_counts, np.ones((len(records),), dtype=np.int64))
+    np.testing.assert_array_equal(pre_transform_counts, np.ones((len(records),), dtype=np.int64))
 
 
 def test_map_style_pairing_restores_optional_fields_after_repacking():

@@ -23,7 +23,7 @@ class PairedTransformedDataset:
     """Random-access dataset whose adjacent chunks remain one shuffle unit.
 
     ``pre_transforms`` canonicalize raw dataset keys. History is then extracted
-    in raw action coordinates and attached to the current record before
+    in raw action coordinates and attached to each paired record before
     ``transforms`` apply action deltas, normalization, and model-width padding.
     """
 
@@ -90,8 +90,18 @@ class PairedTransformedDataset:
 
         if "actions" not in previous or "actions" not in current:
             raise KeyError("paired records must contain actions after pre_transforms")
-        previous_history, previous_history_mask = self._history_before(previous_index, previous["actions"])
-        current_history, current_history_mask = self._history_before(current_index, current["actions"])
+        previous_actions_for_history = self._validate_pair_actions(previous["actions"])
+        current_actions_for_history = self._validate_pair_actions(current["actions"])
+        action_cache = {
+            self._record_keys[previous_index]: previous_actions_for_history.copy(),
+            self._record_keys[current_index]: current_actions_for_history.copy(),
+        }
+        previous_history, previous_history_mask = self._history_before(
+            previous_index, previous_actions_for_history, action_cache
+        )
+        current_history, current_history_mask = self._history_before(
+            current_index, current_actions_for_history, action_cache
+        )
         previous = dict(previous)
         previous["action_history"] = previous_history
         previous["action_history_mask"] = previous_history_mask
@@ -128,23 +138,38 @@ class PairedTransformedDataset:
             raise KeyError("transformed paired records must contain actions")
         return {key: value for key, value in data.items() if key != "actions"}, data["actions"]
 
-    def _history_before(self, record_index: int, actions: object) -> tuple[np.ndarray, np.ndarray]:
+    def _validate_pair_actions(self, actions: object) -> np.ndarray:
         actions = np.asarray(actions)
         if actions.ndim != 2:
             raise ValueError("paired record actions must be rank 2 [horizon, action_dim]")
+        if self._history_length > actions.shape[0]:
+            raise ValueError("history_length must not exceed the paired record action horizon")
+        if self._stride > actions.shape[0]:
+            raise ValueError("stride must not exceed the paired record action horizon")
+        return actions
 
+    def _history_before(
+        self,
+        record_index: int,
+        actions: np.ndarray,
+        action_cache: dict[tuple[int, int], np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray]:
         history = np.zeros((self._history_length, actions.shape[-1]), dtype=actions.dtype)
         history_mask = np.zeros((self._history_length,), dtype=bool)
         episode, frame = self._record_keys[record_index]
         for position in range(self._history_length):
             history_frame = frame - self._history_length + position
-            source_index = self._record_lookup.get((episode, history_frame))
+            source_key = (episode, history_frame)
+            source_index = self._record_lookup.get(source_key)
             if source_index is None:
                 continue
-            source = self._apply(copy.deepcopy(self._dataset[source_index]), self._pre_transforms)
-            if "actions" not in source:
-                raise KeyError("history source record must contain actions after pre_transforms")
-            source_actions = np.asarray(source["actions"])
+            source_actions = action_cache.get(source_key)
+            if source_actions is None:
+                source = self._apply(copy.deepcopy(self._dataset[source_index]), self._pre_transforms)
+                if "actions" not in source:
+                    raise KeyError("history source record must contain actions after pre_transforms")
+                source_actions = np.asarray(source["actions"]).copy()
+                action_cache[source_key] = source_actions
             if source_actions.ndim != 2 or source_actions.shape[-1] != actions.shape[-1]:
                 raise ValueError("history source actions must match the paired action shape")
             history[position] = source_actions[0]
