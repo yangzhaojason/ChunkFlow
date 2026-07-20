@@ -1,0 +1,278 @@
+import dataclasses
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
+import pytest
+
+from openpi.models import model as _model
+from openpi.training import chunkflow_batch
+from openpi.training.chunkflow_awac_train import compute_awac_objectives
+
+
+class _FlowOutput(NamedTuple):
+    loss: jax.Array
+    velocity: jax.Array
+    x_t: jax.Array
+    time: jax.Array
+
+
+@dataclasses.dataclass(frozen=True)
+class _AwacConfig:
+    action_dim: int = 2
+    action_horizon: int = 3
+    awac_gamma: float = 0.9
+    awac_expectile_tau_e: float = 0.7
+    awac_temperature_tau: float = 0.5
+    awac_wmax: float = 10.0
+    awac_actor_weight: float = 1.25
+    awac_q_weight: float = 0.75
+    awac_v_weight: float = 1.5
+    kl_beta: float = 0.2
+
+
+class _TinyAwacActor:
+    action_dim = 2
+    action_horizon = 3
+
+    def __init__(self, scale, calls=None):
+        self.scale = jnp.asarray(scale)
+        self.calls = calls
+
+    def compute_paired_loss(
+        self,
+        rng,
+        previous_observation,
+        previous_actions,
+        observation,
+        actions,
+        *,
+        ema_model,
+        step,
+        train,
+    ):
+        del previous_observation, previous_actions, observation, train
+        if self.calls is not None:
+            self.calls["supervised_rng"] = rng
+        ema_anchor = jax.lax.stop_gradient(ema_model.scale)
+        loss = jnp.mean(jnp.square(self.scale * actions - 0.25))
+        loss = loss + 0.0 * ema_anchor + 0.0 * step
+        return loss, {"loss/flow": loss, "history/alpha": jnp.asarray(0.0)}
+
+    def encode_critic_state(self, rng, observation, *, train):
+        del train
+        if self.calls is not None:
+            self.calls.setdefault("state_rngs", []).append(rng)
+        state = self.scale * observation.state
+        feature = jnp.concatenate((state, self.scale * jnp.ones((state.shape[0], 1))), axis=-1)
+        return jax.lax.stop_gradient(feature)
+
+    def first_action_flow_forward(
+        self,
+        rng,
+        observation,
+        executed_action,
+        *,
+        train,
+        dummy_tail,
+        noise,
+        time,
+    ):
+        del observation, train
+        if self.calls is not None:
+            self.calls["flow"] = {
+                "rng": rng,
+                "preprocess_rng": jax.random.split(rng, 3)[0],
+                "dummy_tail": dummy_tail,
+                "noise": noise,
+                "time": time,
+            }
+        velocity = self.scale * (executed_action + 0.5)
+        target_velocity = noise[:, 0] - executed_action
+        loss = jnp.mean(jnp.square(velocity - target_velocity), axis=-1)
+        x_t = time[:, None] * noise[:, 0] + (1.0 - time[:, None]) * executed_action
+        return _FlowOutput(loss=loss, velocity=velocity, x_t=x_t, time=time)
+
+
+class _TinyCritic:
+    def __init__(self, q_scale, v_scale):
+        self.q_scale = jnp.asarray(q_scale)
+        self.v_scale = jnp.asarray(v_scale)
+
+    def q_value(self, state, action):
+        return self.q_scale * (jnp.sum(state, axis=-1) + jnp.sum(action, axis=-1) + 0.5)
+
+    def value(self, state):
+        return self.v_scale * (jnp.sum(state, axis=-1) - 0.25)
+
+
+class _TinyValue:
+    def __init__(self, scale):
+        self.scale = jnp.asarray(scale)
+
+    def __call__(self, state):
+        return self.scale * jnp.sum(state, axis=-1)
+
+
+class _NeverCalledCritic:
+    def __init__(self):
+        self.called = False
+
+    def q_value(self, state, action):
+        del state, action
+        self.called = True
+        raise AssertionError("critic must not run for an invalid transition batch")
+
+    def value(self, state):
+        del state
+        self.called = True
+        raise AssertionError("critic must not run for an invalid transition batch")
+
+
+def _observation(state):
+    state = jnp.asarray(state, dtype=jnp.float32)
+    return _model.Observation(images={}, image_masks={}, state=state)
+
+
+def _tiny_composite_batch():
+    previous_observation = _observation([[0.0, 0.1], [0.2, -0.1]])
+    observation = _observation([[0.2, -0.1], [0.4, 0.3]])
+    next_observation = _observation([[0.3, 0.0], [0.5, 0.2]])
+    return chunkflow_batch.ChunkFlowTrainBatch(
+        supervised=chunkflow_batch.PairedChunkBatch(
+            previous_observation=previous_observation,
+            previous_actions=jnp.full((2, 3, 2), 0.1, dtype=jnp.float32),
+            observation=observation,
+            actions=jnp.full((2, 3, 2), 0.3, dtype=jnp.float32),
+            step=jnp.asarray(0, dtype=jnp.int32),
+        ),
+        transition=chunkflow_batch.StepTransitionBatch(
+            observation=observation,
+            executed_action=jnp.asarray([[0.2, 0.4], [-0.3, 0.1]], dtype=jnp.float32),
+            reward=jnp.asarray([0.5, -0.2], dtype=jnp.float32),
+            continuation=jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+            next_observation=next_observation,
+            episode_id=jnp.asarray([4, 4], dtype=jnp.int32),
+            frame_index=jnp.asarray([7, 8], dtype=jnp.int32),
+        ),
+    )
+
+
+def test_awac_objectives_keep_actor_and_critic_gradients_disjoint():
+    batch = _tiny_composite_batch()
+
+    def loss(actor_scale, q_scale, v_scale, reference_scale):
+        actor = _TinyAwacActor(actor_scale)
+        critic = _TinyCritic(q_scale, v_scale)
+        result = compute_awac_objectives(
+            actor,
+            critic,
+            _TinyValue(0.25),
+            _TinyAwacActor(reference_scale),
+            _TinyAwacActor(1.0),
+            batch,
+            jax.random.key(0),
+            _AwacConfig(),
+        )
+        return result.actor_objective, result.critic_objective
+
+    actor_from_actor, q_from_actor, v_from_actor, ref_from_actor = jax.grad(
+        lambda *args: loss(*args)[0], argnums=(0, 1, 2, 3)
+    )(1.0, 2.0, 0.5, 0.75)
+    actor_from_critic, q_from_critic, v_from_critic = jax.grad(
+        lambda a, q, v: loss(a, q, v, 0.75)[1], argnums=(0, 1, 2)
+    )(1.0, 2.0, 0.5)
+
+    assert actor_from_actor != 0
+    assert q_from_actor == 0
+    assert v_from_actor == 0
+    assert ref_from_actor == 0
+    assert actor_from_critic == 0
+    assert q_from_critic != 0
+    assert v_from_critic != 0
+
+
+def test_awac_objectives_share_exact_flow_random_inputs():
+    batch = _tiny_composite_batch()
+    current_calls = {}
+    reference_calls = {}
+    rng = jax.random.key(17)
+    result = compute_awac_objectives(
+        _TinyAwacActor(1.0, current_calls),
+        _TinyCritic(2.0, 0.5),
+        _TinyValue(0.25),
+        _TinyAwacActor(0.75, reference_calls),
+        _TinyAwacActor(1.0),
+        batch,
+        rng,
+        _AwacConfig(),
+    )
+
+    supervised_rng, state_rng, next_state_rng, flow_rng, noise_rng, time_rng = jax.random.split(rng, 6)
+    expected_noise = jax.random.normal(noise_rng, (2, 3, 2), dtype=jnp.float32)
+    expected_time = jax.random.beta(time_rng, 1.5, 1.0, (2,)) * 0.999 + 0.001
+    expected_preprocess_rng = jax.random.split(flow_rng, 3)[0]
+    current_flow = current_calls["flow"]
+    reference_flow = reference_calls["flow"]
+
+    assert jnp.array_equal(current_calls["supervised_rng"], supervised_rng)
+    assert jnp.array_equal(current_calls["state_rngs"][0], state_rng)
+    assert jnp.array_equal(current_calls["state_rngs"][1], next_state_rng)
+    assert jnp.array_equal(current_flow["rng"], flow_rng)
+    assert jnp.array_equal(reference_flow["rng"], flow_rng)
+    assert jnp.array_equal(current_flow["preprocess_rng"], expected_preprocess_rng)
+    assert jnp.array_equal(reference_flow["preprocess_rng"], expected_preprocess_rng)
+    assert current_flow["noise"] is reference_flow["noise"]
+    assert current_flow["time"] is reference_flow["time"]
+    assert current_flow["dummy_tail"] is reference_flow["dummy_tail"]
+    assert jnp.array_equal(current_flow["noise"], expected_noise)
+    assert jnp.array_equal(current_flow["time"], expected_time)
+    assert jnp.array_equal(current_flow["dummy_tail"], jnp.zeros((2, 2, 2), dtype=jnp.float32))
+    assert all(jnp.isfinite(value) for value in result.metrics.values())
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("empty_action", "executed_action"),
+        ("reward_rank", "reward"),
+        ("continuation_batch", "continuation"),
+        ("episode_rank", "episode_id"),
+        ("frame_batch", "frame_index"),
+        ("observation_batch", "transition.observation.state"),
+        ("next_observation_batch", "transition.next_observation.state"),
+    ],
+)
+def test_awac_objectives_validate_transition_shapes_before_critic(case, message):
+    batch = _tiny_composite_batch()
+    transition = batch.transition
+    if case == "empty_action":
+        transition = transition.replace(executed_action=jnp.zeros((0, 2), dtype=jnp.float32))
+    elif case == "reward_rank":
+        transition = transition.replace(reward=jnp.zeros((2, 1), dtype=jnp.float32))
+    elif case == "continuation_batch":
+        transition = transition.replace(continuation=jnp.zeros((1,), dtype=jnp.float32))
+    elif case == "episode_rank":
+        transition = transition.replace(episode_id=jnp.zeros((2, 1), dtype=jnp.int32))
+    elif case == "frame_batch":
+        transition = transition.replace(frame_index=jnp.zeros((1,), dtype=jnp.int32))
+    elif case == "observation_batch":
+        transition = transition.replace(observation=_observation([[0.0, 0.0]]))
+    elif case == "next_observation_batch":
+        transition = transition.replace(next_observation=_observation([[0.0, 0.0]]))
+    invalid_batch = batch.replace(transition=transition)
+    critic = _NeverCalledCritic()
+
+    with pytest.raises(ValueError, match=message):
+        compute_awac_objectives(
+            _TinyAwacActor(1.0),
+            critic,
+            _TinyValue(0.25),
+            _TinyAwacActor(0.75),
+            _TinyAwacActor(1.0),
+            invalid_batch,
+            jax.random.key(0),
+            _AwacConfig(),
+        )
+
+    assert not critic.called

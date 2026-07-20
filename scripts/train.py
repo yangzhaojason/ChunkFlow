@@ -29,6 +29,7 @@ from openpi.models import chunkflow_critic as _chunkflow_critic
 import openpi.models.model as _model  # 项目：模型基类与类型
 import openpi.shared.array_typing as at  # 项目：数组/类型别名
 import openpi.shared.nnx_utils as nnx_utils  # 项目：NNX 工具函数
+from openpi.training import chunkflow_awac_train as _chunkflow_awac_train
 from openpi.training import chunkflow_batch as _chunkflow_batch
 from openpi.training import chunkflow_train as _chunkflow_train
 import openpi.training.checkpoints as _checkpoints  # 项目：checkpoint 管理
@@ -222,6 +223,15 @@ def train_step(
     batch: _data_loader.TrainingBatch,  # legacy 或 episode-paired batch
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:  # 返回新状态与指标字典
     """单步训练：前向计算损失，求梯度并应用更新，返回新状态与指标。"""
+    is_awac_batch = isinstance(batch, _chunkflow_batch.ChunkFlowTrainBatch)
+    awac_enabled = bool(getattr(config.model, "awac_enable", False))
+    if awac_enabled and not is_awac_batch:
+        raise ValueError("ChunkFlow AWAC requires a composite supervised/transition batch")
+    if is_awac_batch and not awac_enabled:
+        raise ValueError("received a ChunkFlow AWAC composite batch while AWAC is disabled")
+    if awac_enabled:
+        return _chunkflow_awac_train.train_step(config, rng, state, batch)
+
     is_paired_batch = isinstance(batch, _chunkflow_batch.PairedChunkBatch)
     chunkflow_enabled = bool(getattr(config.model, "chunkflow_supervised_enabled", False))
     if chunkflow_enabled and not is_paired_batch:
