@@ -292,6 +292,21 @@ def test_step_transition_accepts_scalar_or_one_element_reward_and_continuation()
     assert transition["continuation"] == 0.25
 
 
+def test_step_transition_normalizes_float64_scalar_fields_to_float32():
+    records = _transition_records()
+    records[0]["reward"] = np.float64(0.25)
+    records[0]["cont"] = np.array([0.5], dtype=np.float64)
+
+    transition = _step_transition_dataset(records)[0]
+
+    assert isinstance(transition["reward"], np.float32)
+    assert isinstance(transition["continuation"], np.float32)
+    assert transition["reward"].dtype == np.float32
+    assert transition["continuation"].dtype == np.float32
+    assert transition["reward"] == np.float32(0.25)
+    assert transition["continuation"] == np.float32(0.5)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

@@ -299,8 +299,8 @@ class StepTransitionDataset:
         return {
             "observation": observation,
             "executed_action": transformed_executed,
-            "reward": reward,
-            "continuation": continuation,
+            "reward": np.float32(reward),
+            "continuation": np.float32(continuation),
             "next_observation": next_observation,
             "episode_id": np.int32(episode),
             "frame_index": np.int32(frame),
