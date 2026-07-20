@@ -326,6 +326,27 @@ def test_awac_objectives_validate_transition_shapes_before_critic(case, message)
     assert not critic.called
 
 
+def test_awac_objectives_allow_images_without_explicit_masks():
+    batch = _tiny_composite_batch()
+    observation = batch.transition.observation.replace(
+        images={"camera": jnp.zeros((2, 4, 4, 3), dtype=jnp.float32)},
+        image_masks={},
+    )
+
+    result = compute_awac_objectives(
+        _TinyAwacActor(1.0),
+        _TinyCritic(2.0, 0.5),
+        _TinyValue(0.25),
+        _TinyAwacActor(0.75),
+        _TinyAwacActor(1.0),
+        batch.replace(transition=batch.transition.replace(observation=observation)),
+        jax.random.key(31),
+        _AwacConfig(),
+    )
+
+    assert jnp.isfinite(result.reported_total)
+
+
 def _malformed_optional_observation(case):
     observation = _observation([[0.2, -0.1], [0.4, 0.3]])
     values = {

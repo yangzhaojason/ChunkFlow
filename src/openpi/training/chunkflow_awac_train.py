@@ -65,8 +65,11 @@ def _validate_observation_batch(
     image_masks = getattr(observation, "image_masks", None)
     if not isinstance(images, Mapping) or not isinstance(image_masks, Mapping):
         raise ValueError(f"{name}.images and {name}.image_masks must be mappings")
-    if set(images) != set(image_masks):
-        raise ValueError(f"{name}.images and {name}.image_masks must have identical keys")
+    unknown_mask_keys = set(image_masks) - set(images)
+    if unknown_mask_keys:
+        raise ValueError(
+            f"{name}.image_masks contains keys without matching images: {sorted(unknown_mask_keys)}"
+        )
     for key, image in images.items():
         _validate_array_leading_batch(
             image,
@@ -74,8 +77,9 @@ def _validate_observation_batch(
             minimum_rank=4,
             name=f"{name}.images[{key!r}]",
         )
+    for key, image_mask in image_masks.items():
         mask_shape = _validate_array_leading_batch(
-            image_masks[key],
+            image_mask,
             batch_size=batch_size,
             minimum_rank=1,
             name=f"{name}.image_masks[{key!r}]",
