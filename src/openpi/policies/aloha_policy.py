@@ -75,11 +75,14 @@ class AlohaInputs(transforms.DataTransformFn):
             "state": data["state"],
         }
 
-        # Actions are only available during training.
-        if "actions" in data:
-            actions = np.asarray(data["actions"])
-            actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
-            inputs["actions"] = actions
+        # Action-valued fields are only available during training.
+        for key in ("actions", "action_history", "executed_actions"):
+            if key in data:
+                values = np.asarray(data[key])
+                inputs[key] = _encode_actions_inv(values, adapt_to_pi=self.adapt_to_pi)
+
+        if "action_history" in inputs and "action_history_mask" in data:
+            inputs["action_history_mask"] = np.asarray(data["action_history_mask"])
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]

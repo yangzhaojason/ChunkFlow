@@ -274,16 +274,20 @@ class StepTransitionDataset:
                 )
             next_raw = copy.deepcopy(current_raw)
             next_executed = executed.copy()
-            if self._history_length > 0:
-                next_history = np.concatenate((history[1:], executed[None]), axis=0)
-                next_history_mask = np.concatenate((history_mask[1:], np.ones((1,), dtype=bool)))
-            else:
-                next_history = history.copy()
-                next_history_mask = history_mask.copy()
         else:
             next_raw = copy.deepcopy(self._dataset[next_index])
             next_executed = self._executed_action(next_raw)
-            next_history, next_history_mask = self._history_before(next_index, next_executed)
+            if next_executed.shape != executed.shape:
+                raise ValueError("current and next raw executed action shapes must match")
+            if next_executed.dtype != executed.dtype:
+                raise ValueError("current and next raw executed action dtypes must match")
+
+        if self._history_length > 0:
+            next_history = np.concatenate((history[1:], executed[None]), axis=0)
+            next_history_mask = np.concatenate((history_mask[1:], np.ones((1,), dtype=bool)))
+        else:
+            next_history = history.copy()
+            next_history_mask = history_mask.copy()
 
         observation, transformed_executed = self._transform_record(
             current_raw,
@@ -299,6 +303,8 @@ class StepTransitionDataset:
         )
         if transformed_executed.shape != transformed_next_executed.shape:
             raise ValueError("current and next transformed executed action shapes must match")
+        if transformed_executed.dtype != transformed_next_executed.dtype:
+            raise ValueError("current and next transformed executed action dtypes must match")
 
         return {
             "observation": observation,
@@ -365,6 +371,8 @@ class StepTransitionDataset:
             source_executed = self._executed_action(source)
             if source_executed.shape != executed.shape:
                 raise ValueError("history executed action shape must match the current executed action shape")
+            if source_executed.dtype != executed.dtype:
+                raise ValueError("history executed action dtype must match the current executed action dtype")
             history[position] = source_executed
             history_mask[position] = True
         return history, history_mask
@@ -398,10 +406,11 @@ class StepTransitionDataset:
             raise KeyError("transformed transition record must contain action history and mask")
         transformed_history = np.asarray(transformed["action_history"])
         transformed_history_mask = np.asarray(transformed["action_history_mask"])
-        if transformed_history.ndim != 2 or transformed_history.shape[0] != self._history_length:
+        expected_history_shape = (self._history_length, transformed_executed.shape[1])
+        if transformed_history.shape != expected_history_shape:
             raise ValueError("transformed action history must have shape [history_length, action_dim]")
-        if transformed_history.shape[1] != transformed_executed.shape[1]:
-            raise ValueError("transformed action history shape must match the transformed executed action shape")
+        if transformed_history.dtype != transformed_executed.dtype:
+            raise ValueError("transformed action history dtype must match the transformed executed action dtype")
         if transformed_history_mask.shape != (self._history_length,):
             raise ValueError("transformed action history mask must have shape [history_length]")
         if not np.issubdtype(transformed_history_mask.dtype, np.bool_):

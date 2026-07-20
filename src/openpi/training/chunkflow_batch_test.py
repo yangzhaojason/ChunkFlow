@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from openpi.policies import aloha_policy
 from openpi.shared import normalize as _normalize
 from openpi.training import chunkflow_batch as _chunkflow_batch
 from openpi.training.chunkflow_batch import PairedChunkBatch
@@ -216,6 +217,93 @@ def test_step_transition_applies_one_action_transform_chain_to_action_and_histor
     np.testing.assert_array_equal(second["observation"]["action_history"], [[-1.0, 0.0, 0.0]])
 
 
+def test_step_transition_preserves_aloha_action_fields_through_real_input_transform():
+    executed = np.stack(
+        [np.linspace(frame, frame + 1.3, 14, dtype=np.float32) for frame in range(3)]
+    )
+    records = [
+        {
+            "state": np.linspace(0.1, 1.4, 14, dtype=np.float32),
+            "images": {
+                "cam_high": np.full((3, 4, 5), frame, dtype=np.uint8),
+                "cam_left_wrist": np.full((3, 4, 5), frame + 1, dtype=np.uint8),
+                "cam_right_wrist": np.full((3, 4, 5), frame + 2, dtype=np.uint8),
+            },
+            "actions": np.stack((executed[frame] + 0.25, executed[frame] + 0.5)),
+            "executed": executed[frame],
+            "reward": np.float32(frame == 2),
+            "cont": np.float32(frame < 2),
+            "unrelated_raw_key": frame,
+        }
+        for frame in range(3)
+    ]
+    captured = []
+
+    def capture_aloha_output(data):
+        captured.append(
+            {
+                key: np.array(value, copy=True)
+                for key, value in data.items()
+                if key
+                in {
+                    "state",
+                    "actions",
+                    "action_history",
+                    "action_history_mask",
+                    "executed_actions",
+                }
+            }
+        )
+        assert "unrelated_raw_key" not in data
+        return data
+
+    delta_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+    dataset = _chunkflow_batch.StepTransitionDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(3, dtype=np.int64),
+        frame_indices=np.arange(3),
+        history_length=1,
+        executed_action_key="executed",
+        reward_key="reward",
+        continuation_key="cont",
+        transforms=(
+            aloha_policy.AlohaInputs(adapt_to_pi=True),
+            capture_aloha_output,
+            _transforms.DeltaActions(delta_mask),
+            _transforms.PadStatesAndActions(model_action_dim=16),
+        ),
+    )
+
+    transition = dataset[1]
+    current = captured[0]
+    raw_action_fields = {
+        "actions": records[1]["actions"],
+        "action_history": executed[0][None],
+        "executed_actions": executed[1][None],
+    }
+    for key, raw_value in raw_action_fields.items():
+        expected = aloha_policy._encode_actions_inv(  # noqa: SLF001
+            np.array(raw_value, copy=True), adapt_to_pi=True
+        )
+        np.testing.assert_allclose(current[key], expected)
+
+    np.testing.assert_array_equal(current["action_history_mask"], [True])
+    expected = _transforms.PadStatesAndActions(model_action_dim=16)(
+        _transforms.DeltaActions(delta_mask)(current)
+    )
+    np.testing.assert_allclose(
+        transition["executed_action"], expected["executed_actions"][0]
+    )
+    np.testing.assert_allclose(
+        transition["observation"]["action_history"], expected["action_history"]
+    )
+    np.testing.assert_array_equal(
+        transition["observation"]["action_history_mask"], [True]
+    )
+    assert transition["executed_action"].shape == (16,)
+    assert transition["observation"]["action_history"].shape == (1, 16)
+
+
 @pytest.mark.parametrize("missing", ["executed", "reward", "cont"])
 def test_step_transition_rejects_missing_required_field(missing):
     records = _transition_records()
@@ -258,6 +346,40 @@ def test_step_transition_accepts_vector_or_nonempty_sequence_executed_action(exe
     dataset = _step_transition_dataset(records, history_length=0)
 
     np.testing.assert_array_equal(dataset[0]["executed_action"], expected)
+
+
+@pytest.mark.parametrize(
+    ("next_executed", "message"),
+    [
+        (np.array([101.0, 102.0], dtype=np.float32), r"raw.*shape"),
+        (np.array([101.0], dtype=np.float64), r"raw.*dtype"),
+    ],
+)
+def test_step_transition_rejects_current_next_raw_action_mismatch_with_zero_history(
+    next_executed, message
+):
+    records = _transition_records()[:2]
+    records[1]["executed"] = next_executed
+
+    with pytest.raises(ValueError, match=message):
+        _step_transition_dataset(records, history_length=0)[0]
+
+
+@pytest.mark.parametrize(
+    ("source_executed", "message"),
+    [
+        (np.array([100.0, 101.0], dtype=np.float32), r"history.*shape"),
+        (np.array([100.0], dtype=np.float64), r"history.*dtype"),
+    ],
+)
+def test_step_transition_rejects_history_source_action_mismatch_before_assignment(
+    source_executed, message
+):
+    records = _transition_records()
+    records[0]["executed"] = source_executed
+
+    with pytest.raises(ValueError, match=message):
+        _step_transition_dataset(records, history_length=1)[1]
 
 
 @pytest.mark.parametrize(
@@ -386,12 +508,80 @@ def test_step_transition_validates_transformed_shapes_and_floating_leaves(field,
         dataset[0]
 
 
+def test_step_transition_rejects_current_next_transformed_executed_dtype_mismatch():
+    def cast_next_executed(data):
+        if np.asarray(data["state"]).item() == 1.0:
+            return {
+                **data,
+                "action_history": np.asarray(data["action_history"], dtype=np.float64),
+                "executed_actions": np.asarray(
+                    data["executed_actions"], dtype=np.float64
+                ),
+            }
+        return data
+
+    dataset = _step_transition_dataset(
+        _transition_records()[:2],
+        history_length=0,
+        transforms=(cast_next_executed,),
+    )
+
+    with pytest.raises(ValueError, match=r"current.*next.*transformed.*dtype"):
+        dataset[0]
+
+
+def test_step_transition_rejects_transformed_history_executed_dtype_mismatch():
+    def cast_history(data):
+        return {
+            **data,
+            "action_history": np.asarray(data["action_history"], dtype=np.float64),
+        }
+
+    dataset = _step_transition_dataset(history_length=1, transforms=(cast_history,))
+
+    with pytest.raises(ValueError, match=r"history.*dtype.*executed"):
+        dataset[1]
+
+
 def test_step_transition_terminal_history_shifts_and_appends_current_action():
     terminal = _step_transition_dataset()[2]
 
     np.testing.assert_array_equal(terminal["observation"]["action_history"], [[100.0], [101.0]])
     np.testing.assert_array_equal(terminal["next_observation"]["action_history"], [[101.0], [102.0]])
     np.testing.assert_array_equal(terminal["next_observation"]["action_history_mask"], [True, True])
+
+
+def test_step_transition_reads_each_required_record_once_for_nonterminal_history():
+    records = [
+        {
+            "state": np.array([float(frame)], dtype=np.float32),
+            "actions": np.array([[900.0 + frame]], dtype=np.float32),
+            "executed": np.array([100.0 + frame], dtype=np.float32),
+            "reward": np.float32(frame == 4),
+            "cont": np.float32(frame < 4),
+        }
+        for frame in range(5)
+    ]
+    source = _CountingDataset(records)
+    dataset = _chunkflow_batch.StepTransitionDataset(
+        source,
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        history_length=2,
+        executed_action_key="executed",
+        reward_key="reward",
+        continuation_key="cont",
+    )
+
+    transition = dataset[2]
+
+    np.testing.assert_array_equal(source.read_counts, [1, 1, 1, 1, 0])
+    np.testing.assert_array_equal(
+        transition["next_observation"]["action_history"], [[101.0], [102.0]]
+    )
+    np.testing.assert_array_equal(
+        transition["next_observation"]["action_history_mask"], [True, True]
+    )
 
 
 def test_step_transition_pretransforms_canonicalize_without_mutating_source_records():
