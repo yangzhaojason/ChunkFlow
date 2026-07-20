@@ -125,8 +125,8 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("overlap_O must satisfy 0 <= overlap_O < action_horizon")
         if isinstance(self.history_length, bool) or not isinstance(self.history_length, numbers.Integral):
             raise ValueError("history_length must be an integer")
-        if not 0 <= self.history_length <= self.chunk_stride:
-            raise ValueError("history_length must satisfy 0 <= history_length <= action_horizon - overlap_O")
+        if not 0 <= self.history_length <= self.action_horizon:
+            raise ValueError("history_length must satisfy 0 <= history_length <= action_horizon")
 
         for name in (
             "history_schedule_warmup_steps",

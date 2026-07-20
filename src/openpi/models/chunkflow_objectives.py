@@ -35,7 +35,7 @@ def coordinate_aligned_predicted_history(
     current_history: jax.Array,
     *,
     stride: int,
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array]:
     """Transfer the previous prediction residual into current action coordinates."""
 
     if previous_endpoint.shape != previous_actions.shape or previous_endpoint.ndim != 3:
@@ -47,16 +47,24 @@ def coordinate_aligned_predicted_history(
         or current_history.shape[2] != previous_actions.shape[2]
     ):
         raise ValueError("current_history batch and action dimensions must match previous actions")
-    history_length = current_history.shape[1]
     horizon = previous_actions.shape[1]
-    if not 0 <= history_length <= stride <= horizon:
-        raise ValueError("history length must satisfy 0 <= P <= stride <= horizon")
+    if not 0 <= stride <= horizon:
+        raise ValueError("stride must satisfy 0 <= stride <= horizon")
 
-    previous_slice = slice(stride - history_length, stride)
+    history_length = current_history.shape[1]
+    covered = min(history_length, stride)
+    prediction_mask = jnp.zeros(current_history.shape[:2], dtype=jnp.bool_)
+    if covered == 0:
+        return current_history, prediction_mask
+
+    previous_slice = slice(stride - covered, stride)
+    history_slice = slice(history_length - covered, history_length)
     residual = (
         previous_endpoint[:, previous_slice] - previous_actions[:, previous_slice]
     ).astype(current_history.dtype)
-    return current_history + residual
+    predicted = current_history.at[:, history_slice].add(residual)
+    prediction_mask = prediction_mask.at[:, history_slice].set(True)
+    return predicted, prediction_mask
 
 
 def combine_supervised_losses(

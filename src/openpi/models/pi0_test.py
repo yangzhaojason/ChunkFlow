@@ -425,12 +425,18 @@ def test_history_segment_cannot_attend_to_future_actions_but_actions_can_see_his
     assert bool(attention[0, 2, 0])
 
 
+def test_paper_history_can_exceed_chunk_stride():
+    config = _pi0_config.Pi0Config(action_horizon=10, overlap_O=8, history_length=4)
+    assert config.chunk_stride == 2
+    assert config.history_length == 4
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
         ({"action_horizon": 4, "overlap_O": 4}, "overlap_O"),
         ({"action_horizon": 4, "overlap_O": -1}, "overlap_O"),
-        ({"action_horizon": 4, "overlap_O": 1, "history_length": 4}, "history_length"),
+        ({"action_horizon": 4, "overlap_O": 1, "history_length": 5}, "history_length"),
         ({"history_length": -1}, "history_length"),
         ({"history_noise_std": -0.1}, "history_noise_std"),
         ({"history_dropout_probability": 1.1}, "history_dropout_probability"),

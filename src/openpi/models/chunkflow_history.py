@@ -94,6 +94,7 @@ def corrupt_history(
     valid_mask: jax.Array,
     predicted: jax.Array,
     *,
+    prediction_mask: jax.Array | None = None,
     noise_std: float,
     dropout_probability: float,
     alpha: float | jax.Array,
@@ -115,6 +116,11 @@ def corrupt_history(
         raise ValueError(
             f"predicted history dtype {predicted.dtype} does not match clean dtype {clean.dtype}"
         )
+    if prediction_mask is None:
+        prediction_mask = valid_mask
+    if prediction_mask.shape != valid_mask.shape or prediction_mask.dtype != jnp.bool_:
+        raise ValueError("prediction_mask must be bool [B, P]")
+    prediction_mask = jnp.logical_and(prediction_mask, valid_mask)
     if (
         isinstance(noise_std, bool)
         or not isinstance(noise_std, numbers.Real)
@@ -143,20 +149,12 @@ def corrupt_history(
     )
     corrupted_demo = jnp.where(dropped[..., None], jnp.zeros_like(noisy_demo), noisy_demo)
     stopped_prediction = jax.lax.stop_gradient(predicted)
-
-    def interpolate(_: None) -> jax.Array:
-        return jax.lax.cond(
-            alpha_array >= 1.0,
-            lambda __: stopped_prediction,
-            lambda __: (1.0 - alpha_array) * corrupted_demo + alpha_array * stopped_prediction,
-            operand=None,
-        )
-
-    mixed = jax.lax.cond(
-        alpha_array <= 0.0,
-        lambda _: corrupted_demo,
-        interpolate,
-        operand=None,
+    effective_alpha = jnp.where(prediction_mask, alpha_array, jnp.zeros_like(alpha_array))
+    effective_alpha = effective_alpha[..., None]
+    mixed_candidate = (
+        (1.0 - effective_alpha) * corrupted_demo + effective_alpha * stopped_prediction
     )
+    mixed = jnp.where(effective_alpha <= 0.0, corrupted_demo, mixed_candidate)
+    mixed = jnp.where(effective_alpha >= 1.0, stopped_prediction, mixed)
     mixed = jnp.where(valid_mask[..., None], mixed, jnp.zeros_like(mixed))
     return mixed, valid_mask

@@ -46,7 +46,7 @@ def test_predicted_history_transfers_residual_into_current_coordinate_frame():
     previous_endpoint = previous_actions + 0.5
     current_history = jnp.array([[[10.0], [11.0]]])
 
-    predicted = coordinate_aligned_predicted_history(
+    predicted, _ = coordinate_aligned_predicted_history(
         previous_endpoint,
         previous_actions,
         current_history,
@@ -56,12 +56,28 @@ def test_predicted_history_transfers_residual_into_current_coordinate_frame():
     assert predicted.tolist() == [[[10.5], [11.5]]]
 
 
+def test_predicted_history_covers_only_positions_available_from_previous_chunk():
+    previous_actions = jnp.arange(10, dtype=jnp.float32).reshape(1, 10, 1)
+    previous_endpoint = previous_actions + 0.5
+    current_history = jnp.array([[[20.0], [21.0], [22.0], [23.0]]])
+
+    predicted, prediction_mask = coordinate_aligned_predicted_history(
+        previous_endpoint,
+        previous_actions,
+        current_history,
+        stride=2,
+    )
+
+    assert predicted.tolist() == [[[20.0], [21.0], [22.5], [23.5]]]
+    assert prediction_mask.tolist() == [[False, False, True, True]]
+
+
 def test_predicted_history_keeps_the_current_history_dtype():
     previous_actions = jnp.zeros((1, 4, 1), dtype=jnp.bfloat16)
     previous_endpoint = previous_actions.astype(jnp.float32) + 0.5
     current_history = jnp.ones((1, 2, 1), dtype=jnp.bfloat16)
 
-    predicted = coordinate_aligned_predicted_history(
+    predicted, _ = coordinate_aligned_predicted_history(
         previous_endpoint,
         previous_actions,
         current_history,

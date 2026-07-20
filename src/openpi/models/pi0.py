@@ -453,7 +453,7 @@ class Pi0(_model.BaseModel):
                 noise=previous_noise,
                 time=time,
             )
-            predicted_history = coordinate_aligned_predicted_history(
+            predicted_history, prediction_mask = coordinate_aligned_predicted_history(
                 ema_previous.endpoint,
                 previous_actions,
                 observation.action_history,
@@ -470,6 +470,7 @@ class Pi0(_model.BaseModel):
                 observation.action_history,
                 observation.action_history_mask,
                 predicted_history,
+                prediction_mask=prediction_mask,
                 noise_std=self.history_noise_std,
                 dropout_probability=self.history_dropout_probability,
                 alpha=alpha,

@@ -139,6 +139,23 @@ def test_scheduled_sampling_is_convex_interpolation():
     assert jnp.allclose(values, 2.0)
 
 
+def test_uncovered_history_positions_keep_corrupted_demo_values():
+    clean = jnp.ones((1, 4, 1))
+    predicted = 5 * clean
+    coverage = jnp.array([[False, False, True, True]])
+    values, _ = corrupt_history(
+        jax.random.key(0),
+        clean,
+        jnp.ones((1, 4), dtype=bool),
+        predicted,
+        prediction_mask=coverage,
+        noise_std=0.0,
+        dropout_probability=1.0,
+        alpha=1.0,
+    )
+    assert values.tolist() == [[[0.0], [0.0], [5.0], [5.0]]]
+
+
 def test_gaussian_noise_matches_split_rng_exactly():
     key = jax.random.key(7)
     clean = jnp.ones((1, 2, 2))
