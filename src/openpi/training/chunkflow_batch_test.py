@@ -114,6 +114,14 @@ def test_paired_transformed_dataset_attaches_raw_history_before_action_transform
             "state": np.array([8.0], dtype=np.float32),
             "actions": np.array([[10.0], [12.0], [14.0], [16.0]], dtype=np.float32),
         },
+        {
+            "state": np.array([0.0], dtype=np.float32),
+            "actions": np.array([[9.0], [0.0], [0.0], [0.0]], dtype=np.float32),
+        },
+        {
+            "state": np.array([0.0], dtype=np.float32),
+            "actions": np.array([[11.0], [0.0], [0.0], [0.0]], dtype=np.float32),
+        },
     ]
     originals = [{key: value.copy() for key, value in record.items()} for record in records]
     stats = {
@@ -129,8 +137,8 @@ def test_paired_transformed_dataset_attaches_raw_history_before_action_transform
     ]
     dataset = PairedTransformedDataset(
         _ListDataset(records),
-        episode_ids=np.array([4, 4]),
-        frame_indices=np.array([0, 3]),
+        episode_ids=np.array([4, 4, 4, 4]),
+        frame_indices=np.array([0, 3, 1, 2]),
         stride=3,
         history_length=2,
         transforms=transforms,
@@ -166,11 +174,12 @@ def test_paired_transformed_dataset_applies_pretransforms_before_history_lookup(
     records = [
         {"raw_state": np.array([0.0]), "raw_actions": np.arange(4.0)[:, None]},
         {"raw_state": np.array([1.0]), "raw_actions": np.arange(4.0, 8.0)[:, None]},
+        {"raw_state": np.array([0.5]), "raw_actions": np.arange(1.0, 5.0)[:, None]},
     ]
     dataset = PairedTransformedDataset(
         _ListDataset(records),
-        episode_ids=np.array([0, 0]),
-        frame_indices=np.array([0, 2]),
+        episode_ids=np.array([0, 0, 0]),
+        frame_indices=np.array([0, 2, 1]),
         stride=2,
         history_length=1,
         pre_transforms=[_transforms.RepackTransform({"state": "raw_state", "actions": "raw_actions"})],
@@ -205,6 +214,24 @@ def test_previous_observation_history_uses_episode_frames_and_left_padding():
     np.testing.assert_array_equal(episode_start_pair["previous_observation"]["action_history_mask"], [False, False])
     np.testing.assert_array_equal(later_pair["previous_observation"]["action_history"], [[0.0], [1.0]])
     np.testing.assert_array_equal(later_pair["previous_observation"]["action_history_mask"], [True, True])
+
+
+def test_paired_dataset_history_can_span_multiple_strides():
+    records = [
+        {"state": np.array([frame], dtype=np.float32), "actions": np.arange(frame, frame + 10, dtype=np.float32)[:, None]}
+        for frame in range(14)
+    ]
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(14, dtype=np.int64),
+        frame_indices=np.arange(14),
+        stride=2,
+        history_length=4,
+        action_horizon=10,
+    )
+    item = dataset[0]
+    np.testing.assert_array_equal(item["observation"]["action_history"][:, 0], [0.0, 0.0, 0.0, 1.0])
+    np.testing.assert_array_equal(item["observation"]["action_history_mask"], [False, False, True, True])
 
 
 def test_map_style_pairing_restores_optional_fields_after_repacking():

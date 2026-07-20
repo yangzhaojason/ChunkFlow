@@ -25,7 +25,7 @@ def paired_episode_action_windows(
     horizon: int,
     stride: int,
     history_length: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Reference NumPy assembly for full, episode-local ChunkFlow windows."""
 
     actions = np.asarray(actions)
@@ -35,17 +35,26 @@ def paired_episode_action_windows(
         raise ValueError("horizon must be positive")
     if stride <= 0 or stride > horizon:
         raise ValueError("stride must satisfy 0 < stride <= horizon")
-    if not 0 <= history_length <= stride:
-        raise ValueError("history_length must satisfy 0 <= history_length <= stride")
+    if not 0 <= history_length <= horizon:
+        raise ValueError("history_length must satisfy 0 <= history_length <= horizon")
 
     pair_count = max(actions.shape[0] - stride - horizon + 1, 0)
     starts = np.arange(0, pair_count, stride, dtype=np.int64)
     offsets = np.arange(horizon, dtype=np.int64)
     previous = actions[starts[:, None] + offsets[None, :]]
     current = actions[starts[:, None] + stride + offsets[None, :]]
-    history = previous[:, stride - history_length : stride].copy()
-    history_mask = np.ones((starts.shape[0], history_length), dtype=bool)
-    return starts, previous, current, history, history_mask
+
+    def gather_history(starts_to_condition: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        indices = starts_to_condition[:, None] - history_length + np.arange(history_length)[None, :]
+        mask = indices >= 0
+        safe = np.maximum(indices, 0)
+        values = actions[safe]
+        values = np.where(mask[..., None], values, np.zeros((), dtype=actions.dtype))
+        return values, mask
+
+    previous_history, previous_mask = gather_history(starts)
+    current_history, current_mask = gather_history(starts + stride)
+    return starts, previous, current, previous_history, previous_mask, current_history, current_mask
 
 
 class TruthActionSpace(Enum):
@@ -800,8 +809,8 @@ class TruthRldsDatasetJointWithoutGripper:
         if chunkflow_stride is not None:
             if not 0 < chunkflow_stride <= action_chunk_size:
                 raise ValueError("chunkflow_stride must satisfy 0 < stride <= action_chunk_size")
-            if not 0 <= history_length <= chunkflow_stride:
-                raise ValueError("history_length must satisfy 0 <= history_length <= chunkflow_stride")
+            if not 0 <= history_length <= action_chunk_size:
+                raise ValueError("history_length must satisfy 0 <= history_length <= action_chunk_size")
 
         def chunk_actions(traj):
             """Splits episode into action chunks."""
@@ -874,12 +883,16 @@ class TruthRldsDatasetJointWithoutGripper:
 
                 previous_actions = tf.gather(traj["actions"], previous_indices)
                 current_actions = tf.gather(traj["actions"], current_indices)
-                previous_history_indices = starts[:, None] - history_length + tf.range(history_length)[None, :]
-                previous_history_mask = previous_history_indices >= 0
-                previous_history = tf.gather(traj["actions"], tf.maximum(previous_history_indices, 0))
-                previous_history = tf.where(
-                    previous_history_mask[..., None], previous_history, tf.zeros_like(previous_history)
-                )
+
+                def gather_history(starts_to_condition):
+                    indices = starts_to_condition[:, None] - history_length + tf.range(history_length)[None, :]
+                    mask = indices >= 0
+                    values = tf.gather(traj["actions"], tf.maximum(indices, 0))
+                    values = tf.where(mask[..., None], values, tf.zeros_like(values))
+                    return values, mask
+
+                previous_history, previous_history_mask = gather_history(starts)
+                current_history, current_history_mask = gather_history(starts + stride)
 
                 def observation_at(indices):
                     return {
@@ -899,8 +912,8 @@ class TruthRldsDatasetJointWithoutGripper:
                     "actions": current_actions,
                     "observation": observation_at(starts + stride),
                     "prompt": tf.gather(traj["prompt"], starts + stride),
-                    "action_history": previous_actions[:, stride - history_length : stride],
-                    "action_history_mask": tf.ones([tf.shape(starts)[0], history_length], dtype=tf.bool),
+                    "action_history": current_history,
+                    "action_history_mask": current_history_mask,
                 }
                 return {"previous": previous, "current": current}
 

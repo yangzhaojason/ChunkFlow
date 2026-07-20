@@ -47,8 +47,10 @@ class PairedTransformedDataset:
         pre_transforms: Sequence[Callable[[Mapping], Mapping]] = (),
         transforms: Sequence[Callable[[Mapping], Mapping]] = (),
     ):
-        if not 0 <= history_length <= stride:
-            raise ValueError("history_length must satisfy 0 <= history_length <= stride")
+        if history_length < 0:
+            raise ValueError("history_length must be non-negative")
+        if action_horizon is not None and history_length > action_horizon:
+            raise ValueError("history_length must satisfy 0 <= history_length <= action_horizon")
         if len(dataset) != len(np.asarray(episode_ids)) or len(dataset) != len(np.asarray(frame_indices)):
             raise ValueError("dataset and episode/frame metadata must have the same length")
 
@@ -88,16 +90,14 @@ class PairedTransformedDataset:
 
         if "actions" not in previous or "actions" not in current:
             raise KeyError("paired records must contain actions after pre_transforms")
-        history, history_mask = history_from_previous_chunk(
-            previous["actions"], stride=self._stride, history_length=self._history_length
-        )
         previous_history, previous_history_mask = self._history_before(previous_index, previous["actions"])
+        current_history, current_history_mask = self._history_before(current_index, current["actions"])
         previous = dict(previous)
         previous["action_history"] = previous_history
         previous["action_history_mask"] = previous_history_mask
         current = dict(current)
-        current["action_history"] = history
-        current["action_history_mask"] = history_mask
+        current["action_history"] = current_history
+        current["action_history_mask"] = current_history_mask
 
         previous = self._apply(previous, self._transforms)
         current = self._apply(current, self._transforms)
