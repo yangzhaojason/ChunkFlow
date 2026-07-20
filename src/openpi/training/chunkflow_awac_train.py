@@ -1,5 +1,6 @@
 """Dual-objective optimization for step-wise ChunkFlow AWAC."""
 
+from collections.abc import Mapping
 import dataclasses
 
 from flax import nnx
@@ -23,14 +24,186 @@ class AwacObjectiveOutput:
     metrics: dict[str, jax.Array]
 
 
-def _validate_observation_batch(observation, *, batch_size: int, name: str) -> None:
-    state = getattr(observation, "state", None)
-    if state is None or not hasattr(state, "shape"):
-        raise ValueError(f"{name}.state must have nonempty shape [B, S]")
-    if state.ndim != 2 or state.shape[0] != batch_size or state.shape[1] <= 0:
+def _validate_array_leading_batch(
+    value,
+    *,
+    batch_size: int,
+    minimum_rank: int,
+    name: str,
+) -> tuple[int, ...]:
+    if value is None or not hasattr(value, "shape"):
+        raise ValueError(f"{name} must be an array with leading batch dimension {batch_size}")
+    shape = tuple(value.shape)
+    if len(shape) < minimum_rank or shape[0] != batch_size:
         raise ValueError(
-            f"{name}.state must have nonempty shape [{batch_size}, S], got {state.shape}"
+            f"{name} must have rank >= {minimum_rank} and leading dimension {batch_size}, got {shape}"
         )
+    return shape
+
+
+def _validate_observation_batch(
+    observation,
+    *,
+    batch_size: int,
+    action_dim: int,
+    action_horizon: int,
+    name: str,
+) -> None:
+    state = getattr(observation, "state", None)
+    state_shape = _validate_array_leading_batch(
+        state,
+        batch_size=batch_size,
+        minimum_rank=2,
+        name=f"{name}.state",
+    )
+    if state_shape != (batch_size, action_dim):
+        raise ValueError(
+            f"{name}.state must have shape [{batch_size}, {action_dim}], got {state_shape}"
+        )
+
+    images = getattr(observation, "images", None)
+    image_masks = getattr(observation, "image_masks", None)
+    if not isinstance(images, Mapping) or not isinstance(image_masks, Mapping):
+        raise ValueError(f"{name}.images and {name}.image_masks must be mappings")
+    if set(images) != set(image_masks):
+        raise ValueError(f"{name}.images and {name}.image_masks must have identical keys")
+    for key, image in images.items():
+        _validate_array_leading_batch(
+            image,
+            batch_size=batch_size,
+            minimum_rank=4,
+            name=f"{name}.images[{key!r}]",
+        )
+        mask_shape = _validate_array_leading_batch(
+            image_masks[key],
+            batch_size=batch_size,
+            minimum_rank=1,
+            name=f"{name}.image_masks[{key!r}]",
+        )
+        if mask_shape != (batch_size,):
+            raise ValueError(
+                f"{name}.image_masks[{key!r}] must have shape [{batch_size}], got {mask_shape}"
+            )
+
+    prompt = getattr(observation, "tokenized_prompt", None)
+    prompt_mask = getattr(observation, "tokenized_prompt_mask", None)
+    if (prompt is None) != (prompt_mask is None):
+        raise ValueError(
+            f"{name}.tokenized_prompt and {name}.tokenized_prompt_mask must be provided together"
+        )
+    prompt_shape = None
+    if prompt is not None:
+        prompt_shape = _validate_array_leading_batch(
+            prompt,
+            batch_size=batch_size,
+            minimum_rank=2,
+            name=f"{name}.tokenized_prompt",
+        )
+        mask_shape = _validate_array_leading_batch(
+            prompt_mask,
+            batch_size=batch_size,
+            minimum_rank=2,
+            name=f"{name}.tokenized_prompt_mask",
+        )
+        if len(prompt_shape) != 2 or mask_shape != prompt_shape:
+            raise ValueError(
+                f"{name}.tokenized_prompt and {name}.tokenized_prompt_mask "
+                f"must share shape [B, L], got {prompt_shape} and {mask_shape}"
+            )
+    for field_name in ("token_ar_mask", "token_loss_mask"):
+        value = getattr(observation, field_name, None)
+        if value is None:
+            continue
+        value_shape = _validate_array_leading_batch(
+            value,
+            batch_size=batch_size,
+            minimum_rank=2,
+            name=f"{name}.{field_name}",
+        )
+        if prompt_shape is None or value_shape != prompt_shape:
+            raise ValueError(
+                f"{name}.{field_name} must match {name}.tokenized_prompt shape, "
+                f"got {value_shape} and {prompt_shape}"
+            )
+
+    history = getattr(observation, "action_history", None)
+    history_mask = getattr(observation, "action_history_mask", None)
+    if (history is None) != (history_mask is None):
+        raise ValueError(
+            f"{name}.action_history and {name}.action_history_mask must be provided together"
+        )
+    if history is not None:
+        history_shape = _validate_array_leading_batch(
+            history,
+            batch_size=batch_size,
+            minimum_rank=3,
+            name=f"{name}.action_history",
+        )
+        history_mask_shape = _validate_array_leading_batch(
+            history_mask,
+            batch_size=batch_size,
+            minimum_rank=2,
+            name=f"{name}.action_history_mask",
+        )
+        if (
+            len(history_shape) != 3
+            or history_shape[1] <= 0
+            or history_shape[2] != action_dim
+            or history_mask_shape != history_shape[:2]
+        ):
+            raise ValueError(
+                f"{name}.action_history must have shape [B, P, {action_dim}] and "
+                f"{name}.action_history_mask must have shape [B, P], got "
+                f"{history_shape} and {history_mask_shape}"
+            )
+
+    for field_name in ("rewards", "discounts"):
+        value = getattr(observation, field_name, None)
+        if value is None:
+            continue
+        value_shape = _validate_array_leading_batch(
+            value,
+            batch_size=batch_size,
+            minimum_rank=2,
+            name=f"{name}.{field_name}",
+        )
+        expected_shape = (batch_size, action_horizon)
+        if value_shape != expected_shape:
+            raise ValueError(
+                f"{name}.{field_name} must have shape {expected_shape}, got {value_shape}"
+            )
+
+    executed_actions = getattr(observation, "executed_actions", None)
+    if executed_actions is not None:
+        executed_shape = _validate_array_leading_batch(
+            executed_actions,
+            batch_size=batch_size,
+            minimum_rank=3,
+            name=f"{name}.executed_actions",
+        )
+        expected_shape = (batch_size, action_horizon, action_dim)
+        if executed_shape != expected_shape:
+            raise ValueError(
+                f"{name}.executed_actions must have shape {expected_shape}, got {executed_shape}"
+            )
+
+    previous_tail = getattr(observation, "prev_chunk_tail_actions", None)
+    if previous_tail is not None:
+        tail_shape = _validate_array_leading_batch(
+            previous_tail,
+            batch_size=batch_size,
+            minimum_rank=3,
+            name=f"{name}.prev_chunk_tail_actions",
+        )
+        if (
+            len(tail_shape) != 3
+            or not 0 < tail_shape[1] < action_horizon
+            or tail_shape[2] != action_dim
+        ):
+            raise ValueError(
+                f"{name}.prev_chunk_tail_actions must have shape [B, O, {action_dim}] "
+                f"with 0 < O < {action_horizon}, got {tail_shape}"
+            )
 
 
 def _validate_awac_batch(
@@ -65,11 +238,15 @@ def _validate_awac_batch(
     _validate_observation_batch(
         supervised.previous_observation,
         batch_size=supervised_batch_size,
+        action_dim=action_dim,
+        action_horizon=action_horizon,
         name="supervised.previous_observation",
     )
     _validate_observation_batch(
         supervised.observation,
         batch_size=supervised_batch_size,
+        action_dim=action_dim,
+        action_horizon=action_horizon,
         name="supervised.observation",
     )
 
@@ -87,11 +264,15 @@ def _validate_awac_batch(
     _validate_observation_batch(
         transition.observation,
         batch_size=batch_size,
+        action_dim=action_dim,
+        action_horizon=action_horizon,
         name="transition.observation",
     )
     _validate_observation_batch(
         transition.next_observation,
         batch_size=batch_size,
+        action_dim=action_dim,
+        action_horizon=action_horizon,
         name="transition.next_observation",
     )
 
@@ -181,20 +362,23 @@ def compute_awac_objectives(
         noise=full_noise,
         time=time,
     )
-    reference_flow = reference_model.first_action_flow_forward(
-        flow_rng,
-        batch.transition.observation,
-        executed,
-        train=True,
-        dummy_tail=dummy_tail,
-        noise=full_noise,
-        time=time,
-    )
     awac_actor = jnp.mean(weight * actor_flow.loss)
-    reference = chunkflow_awac.reference_consistency_loss(
-        actor_flow.velocity,
-        reference_flow.velocity,
-    )
+    if model_config.kl_beta == 0.0:
+        reference = jnp.zeros((), dtype=actor_flow.velocity.dtype)
+    else:
+        reference_flow = reference_model.first_action_flow_forward(
+            flow_rng,
+            batch.transition.observation,
+            executed,
+            train=True,
+            dummy_tail=dummy_tail,
+            noise=full_noise,
+            time=time,
+        )
+        reference = chunkflow_awac.reference_consistency_loss(
+            actor_flow.velocity,
+            reference_flow.velocity,
+        )
     actor_objective = (
         supervised
         + model_config.awac_actor_weight * awac_actor

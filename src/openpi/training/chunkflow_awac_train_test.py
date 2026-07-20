@@ -1,4 +1,5 @@
 import dataclasses
+import types
 from typing import NamedTuple
 
 import jax
@@ -129,6 +130,33 @@ class _NeverCalledCritic:
         raise AssertionError("critic must not run for an invalid transition batch")
 
 
+class _NeverCalledModel:
+    action_dim = 2
+    action_horizon = 3
+
+    def __init__(self):
+        self.called = False
+
+    def _fail(self, *args, **kwargs):
+        del args, kwargs
+        self.called = True
+        raise AssertionError("model must not run for an invalid transition batch")
+
+    compute_paired_loss = _fail
+    encode_critic_state = _fail
+    first_action_flow_forward = _fail
+
+
+class _ReferenceMustNotRun:
+    def __init__(self):
+        self.called = False
+
+    def first_action_flow_forward(self, *args, **kwargs):
+        del args, kwargs
+        self.called = True
+        raise AssertionError("zero reference coefficient must skip the reference forward")
+
+
 def _observation(state):
     state = jnp.asarray(state, dtype=jnp.float32)
     return _model.Observation(images={}, image_masks={}, state=state)
@@ -231,6 +259,26 @@ def test_awac_objectives_share_exact_flow_random_inputs():
     assert all(jnp.isfinite(value) for value in result.metrics.values())
 
 
+def test_awac_objectives_skip_reference_forward_when_coefficient_is_zero():
+    reference = _ReferenceMustNotRun()
+    result = compute_awac_objectives(
+        _TinyAwacActor(1.0),
+        _TinyCritic(2.0, 0.5),
+        _TinyValue(0.25),
+        reference,
+        _TinyAwacActor(1.0),
+        _tiny_composite_batch(),
+        jax.random.key(23),
+        dataclasses.replace(_AwacConfig(), kl_beta=0.0),
+    )
+
+    reference_metric = result.metrics["awac/reference_consistency"]
+    assert not reference.called
+    assert reference_metric.shape == ()
+    assert reference_metric.dtype == jnp.float32
+    assert reference_metric == 0
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     [
@@ -275,4 +323,117 @@ def test_awac_objectives_validate_transition_shapes_before_critic(case, message)
             _AwacConfig(),
         )
 
+    assert not critic.called
+
+
+def _malformed_optional_observation(case):
+    observation = _observation([[0.2, -0.1], [0.4, 0.3]])
+    values = {
+        field.name: getattr(observation, field.name)
+        for field in dataclasses.fields(observation)
+    }
+
+    def replace(**updates):
+        return types.SimpleNamespace(**(values | updates))
+
+    if case == "state_width":
+        return replace(state=jnp.zeros((2, 3), dtype=jnp.float32))
+    if case == "image_batch":
+        return replace(
+            images={"camera": jnp.zeros((1, 4, 4, 3), dtype=jnp.float32)},
+            image_masks={"camera": jnp.ones((2,), dtype=jnp.bool_)},
+        )
+    if case == "image_mask_batch":
+        return replace(
+            images={"camera": jnp.zeros((2, 4, 4, 3), dtype=jnp.float32)},
+            image_masks={"camera": jnp.ones((1,), dtype=jnp.bool_)},
+        )
+    if case == "image_key_pair":
+        return replace(
+            images={"camera": jnp.zeros((2, 4, 4, 3), dtype=jnp.float32)},
+            image_masks={"other": jnp.ones((2,), dtype=jnp.bool_)},
+        )
+    if case == "token_batch":
+        return replace(
+            tokenized_prompt=jnp.zeros((1, 4), dtype=jnp.int32),
+            tokenized_prompt_mask=jnp.ones((1, 4), dtype=jnp.bool_),
+        )
+    if case == "prompt_mask_shape":
+        return replace(
+            tokenized_prompt=jnp.zeros((2, 4), dtype=jnp.int32),
+            tokenized_prompt_mask=jnp.ones((2, 3), dtype=jnp.bool_),
+        )
+    if case == "token_ar_batch":
+        return replace(
+            tokenized_prompt=jnp.zeros((2, 4), dtype=jnp.int32),
+            tokenized_prompt_mask=jnp.ones((2, 4), dtype=jnp.bool_),
+            token_ar_mask=jnp.zeros((1, 4), dtype=jnp.int32),
+        )
+    if case == "token_loss_batch":
+        return replace(
+            tokenized_prompt=jnp.zeros((2, 4), dtype=jnp.int32),
+            tokenized_prompt_mask=jnp.ones((2, 4), dtype=jnp.bool_),
+            token_loss_mask=jnp.ones((1, 4), dtype=jnp.bool_),
+        )
+    if case == "history_batch":
+        return replace(
+            action_history=jnp.zeros((1, 2, 2), dtype=jnp.float32),
+            action_history_mask=jnp.ones((1, 2), dtype=jnp.bool_),
+        )
+    if case == "history_mask_shape":
+        return replace(
+            action_history=jnp.zeros((2, 2, 2), dtype=jnp.float32),
+            action_history_mask=jnp.ones((2, 1), dtype=jnp.bool_),
+        )
+    if case == "rewards_batch":
+        return replace(rewards=jnp.zeros((1, 3), dtype=jnp.float32))
+    if case == "discounts_batch":
+        return replace(discounts=jnp.zeros((1, 3), dtype=jnp.float32))
+    if case == "executed_actions_batch":
+        return replace(executed_actions=jnp.zeros((1, 3, 2), dtype=jnp.float32))
+    if case == "prev_tail_batch":
+        return replace(prev_chunk_tail_actions=jnp.zeros((1, 1, 2), dtype=jnp.float32))
+    raise AssertionError(f"unknown malformed observation case: {case}")
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("state_width", "state"),
+        ("image_batch", "camera"),
+        ("image_mask_batch", "image_masks"),
+        ("image_key_pair", "image"),
+        ("token_batch", "tokenized_prompt"),
+        ("prompt_mask_shape", "tokenized_prompt_mask"),
+        ("token_ar_batch", "token_ar_mask"),
+        ("token_loss_batch", "token_loss_mask"),
+        ("history_batch", "action_history"),
+        ("history_mask_shape", "action_history_mask"),
+        ("rewards_batch", "rewards"),
+        ("discounts_batch", "discounts"),
+        ("executed_actions_batch", "executed_actions"),
+        ("prev_tail_batch", "prev_chunk_tail_actions"),
+    ],
+)
+def test_awac_objectives_validate_all_observation_leaves_before_model_forward(case, message):
+    batch = _tiny_composite_batch()
+    invalid_batch = batch.replace(
+        transition=batch.transition.replace(observation=_malformed_optional_observation(case))
+    )
+    model = _NeverCalledModel()
+    critic = _NeverCalledCritic()
+
+    with pytest.raises(ValueError, match=message):
+        compute_awac_objectives(
+            model,
+            critic,
+            _TinyValue(0.25),
+            _TinyAwacActor(0.75),
+            _TinyAwacActor(1.0),
+            invalid_batch,
+            jax.random.key(0),
+            _AwacConfig(),
+        )
+
+    assert not model.called
     assert not critic.called
