@@ -167,26 +167,40 @@ def _build_droid_dataset(
             ),
             tf.int32,
         )
-        episode_seed = tf.random.experimental.stateless_fold_in(
-            tf.constant((seed, 0), dtype=tf.int32),
-            episode_id,
-        )
-        camera_seed = tf.random.experimental.stateless_fold_in(episode_seed, 0)
-        language_seed = tf.random.experimental.stateless_fold_in(episode_seed, 1)
-        exterior_img = tf.cond(
-            tf.random.stateless_uniform((), seed=camera_seed) > 0.5,
-            lambda: traj["observation"]["exterior_image_1_left"],
-            lambda: traj["observation"]["exterior_image_2_left"],
-        )
-        instructions = tf.stack(
-            (
-                traj["language_instruction"],
-                traj["language_instruction_2"],
-                traj["language_instruction_3"],
-            ),
-            axis=0,
-        )
-        instruction = tf.random.experimental.stateless_shuffle(instructions, seed=language_seed)[0]
+        if chunkflow_mode == "legacy":
+            exterior_img = tf.cond(
+                tf.random.uniform(shape=[]) > 0.5,
+                lambda: traj["observation"]["exterior_image_1_left"],
+                lambda: traj["observation"]["exterior_image_2_left"],
+            )
+            instruction = tf.random.shuffle(
+                [
+                    traj["language_instruction"],
+                    traj["language_instruction_2"],
+                    traj["language_instruction_3"],
+                ]
+            )[0]
+        else:
+            episode_seed = tf.random.experimental.stateless_fold_in(
+                tf.constant((seed, 0), dtype=tf.int32),
+                episode_id,
+            )
+            camera_seed = tf.random.experimental.stateless_fold_in(episode_seed, 0)
+            language_seed = tf.random.experimental.stateless_fold_in(episode_seed, 1)
+            exterior_img = tf.cond(
+                tf.random.stateless_uniform((), seed=camera_seed) > 0.5,
+                lambda: traj["observation"]["exterior_image_1_left"],
+                lambda: traj["observation"]["exterior_image_2_left"],
+            )
+            instructions = tf.stack(
+                (
+                    traj["language_instruction"],
+                    traj["language_instruction_2"],
+                    traj["language_instruction_3"],
+                ),
+                axis=0,
+            )
+            instruction = tf.random.experimental.stateless_shuffle(instructions, seed=language_seed)[0]
 
         trajectory_length = tf.shape(actions)[0]
         frame_index = tf.cast(traj["_frame_index"], tf.int32)

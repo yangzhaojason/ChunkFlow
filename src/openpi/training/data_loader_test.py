@@ -1,6 +1,8 @@
+import ast
 import copy
 import dataclasses
 import inspect
+import textwrap
 
 import jax
 import numpy as np
@@ -10,6 +12,7 @@ from openpi.models import pi0_config
 from openpi.training import chunkflow_batch
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+from openpi.training import droid_rlds_dataset as _droid_rlds_dataset
 import openpi.transforms as _transforms
 
 
@@ -506,6 +509,59 @@ def test_exact_rlds_chunkflow_capabilities_and_constructor_modes():
     for dataset_class in unsupported:
         assert not hasattr(dataset_class, "supports_chunkflow_pairs")
         assert not hasattr(dataset_class, "supports_chunkflow_transitions")
+
+
+def test_droid_random_selection_preserves_legacy_resampling():
+    def qualified_name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            prefix = qualified_name(node.value)
+            return f"{prefix}.{node.attr}" if prefix else node.attr
+        return ""
+
+    def calls_in(statements):
+        module = ast.Module(body=statements, type_ignores=[])
+        return {
+            qualified_name(node.func)
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+        }
+
+    source = textwrap.dedent(inspect.getsource(_droid_rlds_dataset._build_droid_dataset))  # noqa: SLF001
+    tree = ast.parse(source)
+    restructure = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "restructure"
+    )
+    mode_branches = [
+        node
+        for node in ast.walk(restructure)
+        if isinstance(node, ast.If)
+        and "chunkflow_mode" in ast.unparse(node.test)
+        and "legacy" in ast.unparse(node.test)
+    ]
+    stateful_calls = {"tf.random.uniform", "tf.random.shuffle"}
+    stateless_calls = {
+        "tf.random.stateless_uniform",
+        "tf.random.experimental.stateless_shuffle",
+    }
+    selection_branch = next(
+        (branch for branch in mode_branches if stateful_calls <= calls_in(branch.body)),
+        None,
+    )
+
+    assert selection_branch is not None, "legacy camera/language selection must use stateful TensorFlow RNG"
+    legacy_calls = calls_in(selection_branch.body)
+    strict_calls = calls_in(selection_branch.orelse)
+    assert not legacy_calls & stateless_calls
+    assert stateless_calls <= strict_calls
+    assert "tf.random.experimental.stateless_fold_in" in strict_calls
+    assert any(isinstance(node, ast.Name) and node.id == "seed" for node in ast.walk(selection_branch))
+
+    selection_calls = stateful_calls | stateless_calls | {"tf.random.experimental.stateless_fold_in"}
+    all_selection_calls = calls_in(restructure.body) & selection_calls
+    branch_selection_calls = (legacy_calls | strict_calls) & selection_calls
+    assert all_selection_calls == branch_selection_calls
 
 
 def test_truth_strict_mode_record_is_built_in_supported_adapter_only():
