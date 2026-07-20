@@ -1,9 +1,12 @@
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import optax
 import pytest
 
+from openpi.models import gemma as _gemma
 from openpi.models import model as _model
+from openpi.models import pi0 as _pi0
 from openpi.models.pi0 import FlowForwardOutput
 from openpi.models.pi0 import Pi0
 from openpi.models.pi0 import history_action_masks
@@ -55,9 +58,18 @@ class _FlowStub(Pi0):
         self.continuity_first_order_weight = 0.0
         self.continuity_second_order_weight = 0.0
         self.velocity = velocity
+        self.strict_action_causality_calls = []
 
-    def _predict_velocity(self, observation, x_t, time):
+    def _predict_velocity(
+        self,
+        observation,
+        x_t,
+        time,
+        *,
+        strict_action_causality=False,
+    ):
         del observation, x_t, time
+        self.strict_action_causality_calls.append(strict_action_causality)
         return self.velocity
 
 
@@ -294,6 +306,12 @@ def _flow_observation():
     )
 
 
+def _replace_observation_unchecked(observation, **updates):
+    for name, value in updates.items():
+        object.__setattr__(observation, name, value)
+    return observation
+
+
 def test_flow_forward_exposes_velocity_endpoint_and_per_step_loss():
     actions = jnp.array([[[1.0], [2.0]]])
     noise = jnp.array([[[5.0], [6.0]]])
@@ -326,6 +344,333 @@ def test_compute_loss_keeps_legacy_per_action_shape_after_flow_refactor():
     )
 
     assert loss.shape == (1, 2)
+
+
+def test_first_action_flow_forward_returns_first_step_and_enables_strict_causality():
+    model = _FlowStub(jnp.zeros((1, 2, 1), dtype=jnp.float32))
+    observation = _flow_observation()
+    noise = jnp.zeros((1, 2, 1), dtype=jnp.float32)
+    time = jnp.array([0.4], dtype=jnp.float32)
+
+    model.flow_forward(
+        jax.random.key(0),
+        observation,
+        jnp.ones((1, 2, 1), dtype=jnp.float32),
+        train=False,
+        noise=noise,
+        time=time,
+    )
+    output = model.first_action_flow_forward(
+        jax.random.key(1),
+        observation,
+        jnp.ones((1, 1), dtype=jnp.float32),
+        train=False,
+        dummy_tail=jnp.zeros((1, 1, 1), dtype=jnp.float32),
+        noise=noise,
+        time=time,
+    )
+
+    assert isinstance(output, _pi0.FirstActionFlowOutput)
+    assert output.loss.shape == (1,)
+    assert output.velocity.shape == (1, 1)
+    assert output.x_t.shape == (1, 1)
+    assert output.time.shape == (1,)
+    assert model.strict_action_causality_calls == [False, True]
+
+
+def test_first_action_flow_loss_is_invariant_to_dummy_tail():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=2,
+        action_horizon=4,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(0))
+    observation = config.fake_obs(batch_size=1)
+    executed = jnp.array([[0.25, -0.5]], dtype=jnp.float32)
+    noise = jax.random.normal(jax.random.key(1), (1, 4, 2))
+    time = jnp.array([0.4], dtype=jnp.float32)
+
+    first = model.first_action_flow_forward(
+        jax.random.key(2),
+        observation,
+        executed,
+        train=False,
+        dummy_tail=jnp.zeros((1, 3, 2)),
+        noise=noise,
+        time=time,
+    )
+    second = model.first_action_flow_forward(
+        jax.random.key(2),
+        observation,
+        executed,
+        train=False,
+        dummy_tail=jnp.full((1, 3, 2), 99.0),
+        noise=noise,
+        time=time,
+    )
+
+    assert jnp.allclose(first.loss, second.loss, atol=1e-5)
+    assert jnp.allclose(first.velocity, second.velocity, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("executed_action", "match"),
+    [
+        (jnp.ones((1, 1, 1), dtype=jnp.float32), "executed_action"),
+        (jnp.ones((1, 2), dtype=jnp.float32), "executed_action"),
+        (jnp.ones((0, 1), dtype=jnp.float32), "B > 0"),
+        (jnp.ones((1, 1), dtype=jnp.int32), "floating dtype"),
+        (jnp.array([[jnp.nan]], dtype=jnp.float32), "finite"),
+    ],
+)
+def test_first_action_flow_rejects_invalid_executed_actions(executed_action, match):
+    model = _FlowStub(jnp.zeros((1, 2, 1), dtype=jnp.float32))
+
+    with pytest.raises(ValueError, match=match):
+        model.first_action_flow_forward(
+            jax.random.key(0),
+            _flow_observation(),
+            executed_action,
+            train=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("dummy_tail", "match"),
+    [
+        (jnp.zeros((1, 2, 1), dtype=jnp.float32), "dummy_tail"),
+        (jnp.zeros((1, 1, 1), dtype=jnp.int32), "floating dtype"),
+        (jnp.zeros((1, 1, 1), dtype=jnp.float16), "dtype"),
+        (jnp.full((1, 1, 1), jnp.nan, dtype=jnp.float32), "finite"),
+    ],
+)
+def test_first_action_flow_rejects_invalid_dummy_tail(dummy_tail, match):
+    model = _FlowStub(jnp.zeros((1, 2, 1), dtype=jnp.float32))
+
+    with pytest.raises(ValueError, match=match):
+        model.first_action_flow_forward(
+            jax.random.key(0),
+            _flow_observation(),
+            jnp.ones((1, 1), dtype=jnp.float32),
+            train=False,
+            dummy_tail=dummy_tail,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"noise": jnp.zeros((1, 2, 1), dtype=jnp.int32)}, "floating dtype"),
+        ({"noise": jnp.zeros((1, 2, 1), dtype=jnp.float16)}, "dtype"),
+        ({"noise": jnp.full((1, 2, 1), jnp.nan, dtype=jnp.float32)}, "finite"),
+        ({"time": jnp.ones((1,), dtype=jnp.int32)}, "floating dtype"),
+        ({"time": jnp.array([jnp.inf], dtype=jnp.float32)}, "finite"),
+    ],
+)
+def test_first_action_flow_rejects_invalid_noise_or_time(kwargs, match):
+    model = _FlowStub(jnp.zeros((1, 2, 1), dtype=jnp.float32))
+
+    with pytest.raises(ValueError, match=match):
+        model.first_action_flow_forward(
+            jax.random.key(0),
+            _flow_observation(),
+            jnp.ones((1, 1), dtype=jnp.float32),
+            train=False,
+            **kwargs,
+        )
+
+
+def test_critic_state_has_expected_shape_and_dtype():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=2,
+        action_horizon=4,
+        history_length=2,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(3))
+    observation = config.fake_obs(batch_size=2)
+
+    feature = model.encode_critic_state(jax.random.key(4), observation, train=False)
+    expected_dim = (
+        _gemma.get_config(config.paligemma_variant).width
+        + _gemma.get_config(config.action_expert_variant).width
+        + config.action_dim
+    )
+
+    assert model.critic_state_dim == expected_dim
+    assert feature.shape == (2, model.critic_state_dim)
+    assert feature.dtype == jnp.float32
+    assert jnp.all(jnp.isfinite(feature))
+
+
+def test_critic_state_has_zero_gradient_to_real_actor_parameters():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=2,
+        action_horizon=4,
+        history_length=2,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(5))
+    observation = config.fake_obs(batch_size=1)
+
+    _, grads = nnx.value_and_grad(
+        lambda actor: jnp.sum(
+            actor.encode_critic_state(jax.random.key(6), observation, train=False)
+        ),
+        argnums=nnx.DiffState(0, nnx.Param),
+    )(model)
+
+    assert optax.global_norm(grads) == 0.0
+
+
+def test_critic_state_uses_zero_history_pool_for_all_padding():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=2,
+        action_horizon=4,
+        history_length=2,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(7))
+    observation = config.fake_obs(batch_size=1).replace(
+        action_history=jnp.full((1, 2, 2), 99.0, dtype=jnp.float32),
+        action_history_mask=jnp.zeros((1, 2), dtype=jnp.bool_),
+    )
+
+    feature = model.encode_critic_state(jax.random.key(8), observation, train=False)
+    history_width = model.action_in_proj.out_features
+    history_start = model.critic_state_dim - history_width - model.action_dim
+    history_stop = model.critic_state_dim - model.action_dim
+
+    assert jnp.array_equal(
+        feature[:, history_start:history_stop],
+        jnp.zeros((1, history_width), dtype=jnp.float32),
+    )
+    assert jnp.array_equal(feature[:, -model.action_dim :], observation.state)
+
+
+def test_critic_state_uses_zero_history_pool_when_history_is_disabled():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=2,
+        action_horizon=4,
+        history_length=0,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(9))
+
+    feature = model.encode_critic_state(
+        jax.random.key(10), config.fake_obs(batch_size=1), train=False
+    )
+    history_width = model.action_in_proj.out_features
+    history_start = model.critic_state_dim - history_width - model.action_dim
+    history_stop = model.critic_state_dim - model.action_dim
+
+    assert jnp.array_equal(
+        feature[:, history_start:history_stop],
+        jnp.zeros((1, history_width), dtype=jnp.float32),
+    )
+
+
+@pytest.mark.parametrize(
+    ("history", "mask", "match"),
+    [
+        (None, None, "required"),
+        (jnp.ones((1, 2, 2), dtype=jnp.float32), None, "provided together"),
+        (None, jnp.ones((1, 2), dtype=jnp.bool_), "provided together"),
+        (
+            jnp.ones((1, 1, 2), dtype=jnp.float32),
+            jnp.ones((1, 1), dtype=jnp.bool_),
+            "history_length",
+        ),
+        (
+            jnp.ones((2, 2, 2), dtype=jnp.float32),
+            jnp.ones((2, 2), dtype=jnp.bool_),
+            "batch",
+        ),
+        (
+            jnp.ones((1, 2, 2), dtype=jnp.int32),
+            jnp.ones((1, 2), dtype=jnp.bool_),
+            "floating dtype",
+        ),
+        (
+            jnp.full((1, 2, 2), jnp.inf, dtype=jnp.float32),
+            jnp.ones((1, 2), dtype=jnp.bool_),
+            "finite",
+        ),
+    ],
+)
+def test_critic_state_validates_required_history(history, mask, match):
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=2,
+        action_horizon=4,
+        history_length=2,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(11))
+    observation = _replace_observation_unchecked(
+        config.fake_obs(batch_size=1),
+        action_history=history,
+        action_history_mask=mask,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        model.encode_critic_state(jax.random.key(12), observation, train=False)
+
+
+def test_critic_state_rejects_history_when_disabled():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=2,
+        action_horizon=4,
+        history_length=0,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(13))
+    observation = config.fake_obs(batch_size=1).replace(
+        action_history=jnp.zeros((1, 0, 2), dtype=jnp.float32),
+        action_history_mask=jnp.zeros((1, 0), dtype=jnp.bool_),
+    )
+
+    with pytest.raises(ValueError, match="absent"):
+        model.encode_critic_state(jax.random.key(14), observation, train=False)
+
+
+@pytest.mark.parametrize(
+    ("state", "match"),
+    [
+        (jnp.ones((2,), dtype=jnp.float32), "state"),
+        (jnp.ones((1, 3), dtype=jnp.float32), "state"),
+        (jnp.ones((2, 2), dtype=jnp.float32), "batch"),
+        (jnp.ones((1, 2), dtype=jnp.int32), "floating dtype"),
+        (jnp.array([[jnp.nan, 0.0]], dtype=jnp.float32), "finite"),
+    ],
+)
+def test_critic_state_rejects_invalid_state(state, match):
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=2,
+        action_horizon=4,
+        history_length=0,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(15))
+    observation = _replace_observation_unchecked(config.fake_obs(batch_size=1), state=state)
+
+    with pytest.raises(ValueError, match=match):
+        model.encode_critic_state(jax.random.key(16), observation, train=False)
 
 
 def _suffix_observation(*, history=True, mask=True):
@@ -403,6 +748,42 @@ def test_history_and_action_tokens_form_two_causal_segments():
 
     assert input_mask.tolist() == [[False, True, True, True, True, True, True]]
     assert ar_mask.tolist() == [True, False, False, True, False, False, False]
+
+
+def test_strict_action_causality_starts_a_segment_for_every_action_after_history():
+    input_mask, ar_mask = history_action_masks(
+        jnp.ones((1, 2), dtype=jnp.bool_),
+        action_horizon=3,
+        strict_action_causality=True,
+    )
+
+    attention = make_attn_mask(input_mask, ar_mask)
+
+    assert ar_mask.tolist() == [True, False, True, True, True]
+    assert not bool(attention[0, 2, 3])
+    assert bool(attention[0, 3, 2])
+    assert not bool(attention[0, 3, 4])
+
+
+def test_strict_action_causality_starts_a_segment_for_every_action_without_history():
+    _, _, ar_mask, _ = _TinyPi05().embed_suffix(
+        _suffix_observation(history=False, mask=False),
+        jnp.ones((1, 2, 2), dtype=jnp.float32),
+        jnp.ones((1,), dtype=jnp.float32),
+        strict_action_causality=True,
+    )
+
+    assert ar_mask.tolist() == [True, True]
+
+
+@pytest.mark.parametrize("value", [1, None, jnp.array(1, dtype=jnp.bool_)])
+def test_strict_action_causality_requires_an_exact_boolean(value):
+    with pytest.raises(ValueError, match="strict_action_causality"):
+        history_action_masks(
+            jnp.ones((1, 1), dtype=jnp.bool_),
+            action_horizon=2,
+            strict_action_causality=value,
+        )
 
 
 def test_zero_length_history_layout_reduces_to_the_action_segment():

@@ -18,6 +18,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -47,13 +48,40 @@ class FlowForwardOutput(NamedTuple):
     endpoint: jax.Array
 
 
+class FirstActionFlowOutput(NamedTuple):
+    loss: jax.Array
+    velocity: jax.Array
+    x_t: jax.Array
+    time: jax.Array
+
+
+def _require_exact_boolean(value: object, *, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool")
+    return value
+
+
+def _validate_floating_finite(array: jax.Array, *, name: str) -> None:
+    if not jnp.issubdtype(array.dtype, jnp.floating):
+        raise ValueError(f"{name} must use a real floating dtype")
+    if isinstance(array, (jax.core.Tracer, jax.ShapeDtypeStruct)):
+        return
+    if not np.all(np.isfinite(np.asarray(array))):
+        raise ValueError(f"{name} must contain only finite values")
+
+
 def history_action_masks(
     history_mask: jax.Array,
     *,
     action_horizon: int,
+    strict_action_causality: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Build validity and segment-start masks for history followed by future actions."""
 
+    strict_action_causality = _require_exact_boolean(
+        strict_action_causality,
+        name="strict_action_causality",
+    )
     history_mask = jnp.asarray(history_mask)
     if history_mask.ndim != 2 or history_mask.dtype != jnp.bool_:
         raise ValueError("history_mask must be bool [B, P]")
@@ -74,8 +102,15 @@ def history_action_masks(
         if history_length > 0
         else jnp.zeros((0,), dtype=jnp.bool_)
     )
-    action_ar = jnp.concatenate(
-        [jnp.ones((1,), dtype=jnp.bool_), jnp.zeros((action_horizon - 1,), dtype=jnp.bool_)]
+    action_ar = (
+        jnp.ones((action_horizon,), dtype=jnp.bool_)
+        if strict_action_causality
+        else jnp.concatenate(
+            [
+                jnp.ones((1,), dtype=jnp.bool_),
+                jnp.zeros((action_horizon - 1,), dtype=jnp.bool_),
+            ]
+        )
     )
     return input_mask, jnp.concatenate([history_ar, action_ar])
 
@@ -139,6 +174,9 @@ class Pi0(_model.BaseModel):
         # 取出 VLM 主干与动作专家的配置（宽度/深度/头数等）
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        self.critic_state_dim = (
+            paligemma_config.width + action_expert_config.width + config.action_dim
+        )
         # TODO：未来改为原生 NNX；当前通过 bridge 连接 Gemma 模块
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
@@ -221,9 +259,94 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
+    def encode_critic_state(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        train: bool,
+    ) -> jax.Array:
+        """Encode a stopped actor feature for the training-only ChunkFlow critic."""
+
+        state = observation.state
+        if state.ndim != 2 or state.shape[1] != self.action_dim or state.shape[0] <= 0:
+            raise ValueError(f"state must have shape [B, {self.action_dim}] with B > 0")
+        _validate_floating_finite(state, name="state")
+        batch_size = state.shape[0]
+        if any(image.shape[0] != batch_size for image in observation.images.values()):
+            raise ValueError("state batch dimension must match observation images")
+
+        has_history = observation.action_history is not None
+        has_history_mask = observation.action_history_mask is not None
+        if has_history != has_history_mask:
+            raise ValueError("action_history and action_history_mask must be provided together")
+        if self.history_length == 0:
+            if has_history:
+                raise ValueError("action history fields must be absent when history is disabled")
+        else:
+            if not has_history:
+                raise ValueError("action history and mask are required when history is enabled")
+            validate_history(
+                observation.action_history,
+                observation.action_history_mask,
+                action_dim=self.action_dim,
+            )
+            if observation.action_history.shape[0] != batch_size:
+                raise ValueError("action_history batch dimension must match state")
+            if observation.action_history.shape[1] != self.history_length:
+                raise ValueError(
+                    f"action_history length {observation.action_history.shape[1]} does not match "
+                    f"configured history_length {self.history_length}"
+                )
+            _validate_floating_finite(observation.action_history, name="action_history")
+
+        observation = _model.preprocess_observation(rng, observation, train=train)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attention = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_output, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attention,
+            positions=positions,
+        )
+        prefix_weight = prefix_mask[..., None].astype(prefix_output.dtype)
+        prefix_pool = jnp.sum(prefix_output * prefix_weight, axis=1) / jnp.maximum(
+            jnp.sum(prefix_weight, axis=1),
+            1.0,
+        )
+
+        if self.history_length == 0:
+            history_pool = jnp.zeros(
+                (batch_size, self.action_in_proj.out_features),
+                dtype=prefix_pool.dtype,
+            )
+        else:
+            history_output = self.action_in_proj(observation.action_history)
+            history_weight = observation.action_history_mask[..., None].astype(
+                history_output.dtype
+            )
+            history_pool = jnp.sum(history_output * history_weight, axis=1) / jnp.maximum(
+                jnp.sum(history_weight, axis=1),
+                1.0,
+            )
+
+        feature = jnp.concatenate([prefix_pool, history_pool, observation.state], axis=-1)
+        feature = feature.astype(jnp.float32)
+        expected_shape = (batch_size, self.critic_state_dim)
+        if feature.shape != expected_shape:
+            raise ValueError(
+                f"critic state feature must have shape {expected_shape}, got {feature.shape}"
+            )
+        return jax.lax.stop_gradient(feature)
+
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        *,
+        strict_action_causality: bool = False,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -231,6 +354,10 @@ class Pi0(_model.BaseModel):
         at.Float[at.Array, "b emb"] | None,
     ]:
         """将状态/动作/时间编码为后缀序列，返回嵌入、掩码以及 adaRMS 条件（Pi05）。"""
+        strict_action_causality = _require_exact_boolean(
+            strict_action_causality,
+            name="strict_action_causality",
+        )
         input_mask = []
         ar_mask = []
         tokens = []
@@ -287,6 +414,7 @@ class Pi0(_model.BaseModel):
             history_and_action_mask, history_and_action_ar_mask = history_action_masks(
                 obs.action_history_mask,
                 action_horizon=self.action_horizon,
+                strict_action_causality=strict_action_causality,
             )
             input_mask.append(history_and_action_mask)
             ar_mask.append(history_and_action_ar_mask)
@@ -294,7 +422,9 @@ class Pi0(_model.BaseModel):
             input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
             # 图像/语言/状态不去关注 action tokens（第一位遮蔽，后续允许因果）
             ar_mask.append(
-                jnp.concatenate(
+                jnp.ones((self.action_horizon,), dtype=jnp.bool_)
+                if strict_action_causality
+                else jnp.concatenate(
                     [
                         jnp.ones((1,), dtype=jnp.bool_),
                         jnp.zeros((self.action_horizon - 1,), dtype=jnp.bool_),
@@ -311,10 +441,19 @@ class Pi0(_model.BaseModel):
         observation: _model.Observation,
         x_t: _model.Actions,
         time: jax.Array,
+        *,
+        strict_action_causality: bool = False,
     ) -> jax.Array:
+        strict_action_causality = _require_exact_boolean(
+            strict_action_causality,
+            name="strict_action_causality",
+        )
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            observation, x_t, time
+            observation,
+            x_t,
+            time,
+            strict_action_causality=strict_action_causality,
         )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
@@ -337,9 +476,14 @@ class Pi0(_model.BaseModel):
         train: bool,
         noise: jax.Array | None = None,
         time: jax.Array | None = None,
+        strict_action_causality: bool = False,
     ) -> FlowForwardOutput:
         """Run one flow-matching forward and expose its endpoint estimate."""
 
+        strict_action_causality = _require_exact_boolean(
+            strict_action_causality,
+            name="strict_action_causality",
+        )
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
         if actions.ndim != 3 or actions.shape[-2:] != (self.action_horizon, self.action_dim):
@@ -360,10 +504,81 @@ class Pi0(_model.BaseModel):
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1.0 - time_expanded) * actions
         target_velocity = noise - actions
-        velocity = self._predict_velocity(observation, x_t, time)
+        velocity = self._predict_velocity(
+            observation,
+            x_t,
+            time,
+            strict_action_causality=strict_action_causality,
+        )
         per_step_loss = jnp.mean(jnp.square(velocity - target_velocity), axis=-1)
         endpoint = flow_endpoint(x_t, velocity, time)
         return FlowForwardOutput(per_step_loss, velocity, x_t, time, endpoint)
+
+    def first_action_flow_forward(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        executed_action: jax.Array,
+        *,
+        train: bool,
+        dummy_tail: jax.Array | None = None,
+        noise: jax.Array | None = None,
+        time: jax.Array | None = None,
+    ) -> FirstActionFlowOutput:
+        """Run strictly causal flow matching for one explicitly executed action."""
+
+        if (
+            executed_action.ndim != 2
+            or executed_action.shape[-1] != self.action_dim
+            or executed_action.shape[0] <= 0
+        ):
+            raise ValueError(
+                f"executed_action must have shape [B, {self.action_dim}] with B > 0"
+            )
+        _validate_floating_finite(executed_action, name="executed_action")
+        batch_size = executed_action.shape[0]
+
+        expected_tail = (batch_size, self.action_horizon - 1, self.action_dim)
+        if dummy_tail is None:
+            dummy_tail = jnp.zeros(expected_tail, dtype=executed_action.dtype)
+        if dummy_tail.shape != expected_tail:
+            raise ValueError(f"dummy_tail must have shape {expected_tail}")
+        _validate_floating_finite(dummy_tail, name="dummy_tail")
+        if dummy_tail.dtype != executed_action.dtype:
+            raise ValueError(
+                f"dummy_tail dtype {dummy_tail.dtype} must match executed_action dtype "
+                f"{executed_action.dtype}"
+            )
+
+        actions = jnp.concatenate([executed_action[:, None], dummy_tail], axis=1)
+        if noise is not None:
+            if noise.shape != actions.shape:
+                raise ValueError(f"noise shape {noise.shape} must match actions {actions.shape}")
+            _validate_floating_finite(noise, name="noise")
+            if noise.dtype != actions.dtype:
+                raise ValueError(
+                    f"noise dtype {noise.dtype} must match actions dtype {actions.dtype}"
+                )
+        if time is not None:
+            if time.shape != (batch_size,):
+                raise ValueError(f"time must have shape ({batch_size},)")
+            _validate_floating_finite(time, name="time")
+
+        output = self.flow_forward(
+            rng,
+            observation,
+            actions,
+            train=train,
+            noise=noise,
+            time=time,
+            strict_action_causality=True,
+        )
+        return FirstActionFlowOutput(
+            loss=output.per_step_loss[:, 0],
+            velocity=output.velocity[:, 0],
+            x_t=output.x_t[:, 0],
+            time=output.time,
+        )
 
     @override
     def compute_loss(
