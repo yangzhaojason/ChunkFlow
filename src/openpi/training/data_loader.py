@@ -511,7 +511,12 @@ def create_torch_data_loader(
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
 
-    def _build_torch_stream_loader(stream_dataset, *, stream_seed: int) -> TorchDataLoader:
+    def _build_torch_stream_loader(
+        stream_dataset,
+        *,
+        stream_seed: int,
+        sampler_seed: int = 0,
+    ) -> TorchDataLoader:
         # Use TorchDataLoader for both frameworks. PyTorch DDP owns shuffling through
         # its sampler; JAX divides the global batch across processes.
         sampler = None
@@ -522,7 +527,7 @@ def create_torch_data_loader(
                     num_replicas=torch.distributed.get_world_size(),
                     rank=torch.distributed.get_rank(),
                     shuffle=shuffle,
-                    seed=stream_seed,
+                    seed=sampler_seed,
                     drop_last=True,
                 )
                 local_batch_size = batch_size // torch.distributed.get_world_size()
@@ -578,7 +583,11 @@ def create_torch_data_loader(
     )
     supervised_loader = DataLoaderImpl(
         data_config,
-        _build_torch_stream_loader(supervised_dataset, stream_seed=seed),
+        _build_torch_stream_loader(
+            supervised_dataset,
+            stream_seed=seed,
+            sampler_seed=seed,
+        ),
     )
 
     if not bool(getattr(model_config, "awac_enable", False)):
@@ -605,7 +614,11 @@ def create_torch_data_loader(
     )
     transition_loader = DataLoaderImpl(
         data_config,
-        _build_torch_stream_loader(transition_dataset, stream_seed=seed + 1),
+        _build_torch_stream_loader(
+            transition_dataset,
+            stream_seed=seed + 1,
+            sampler_seed=seed + 1,
+        ),
     )
     return CompositeDataLoader(data_config, supervised_loader, transition_loader)
 

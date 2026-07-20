@@ -214,6 +214,78 @@ def test_composite_loader_uses_independent_seeds_for_supervised_and_transition_s
     assert seeds == [7, 8]
 
 
+def _capture_pytorch_ddp_seeds(monkeypatch):
+    sampler_seeds = []
+    stream_seeds = []
+
+    class _CapturingDistributedSampler:
+        def __init__(self, dataset, **kwargs):
+            del dataset
+            sampler_seeds.append(kwargs.get("seed", 0))
+
+    class _CapturingTorchDataLoader:
+        def __init__(self, dataset, **kwargs):
+            del dataset
+            stream_seeds.append(kwargs["seed"])
+
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setattr(_data_loader.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(_data_loader.torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(_data_loader.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        _data_loader.torch.utils.data.distributed,
+        "DistributedSampler",
+        _CapturingDistributedSampler,
+    )
+    monkeypatch.setattr(_data_loader, "TorchDataLoader", _CapturingTorchDataLoader)
+    return sampler_seeds, stream_seeds
+
+
+def test_legacy_pytorch_ddp_preserves_default_sampler_seed_and_requested_stream_seed(monkeypatch):
+    sampler_seeds, stream_seeds = _capture_pytorch_ddp_seeds(monkeypatch)
+    model_config = pi0_config.Pi0Config(action_dim=4, action_horizon=4)
+
+    loader = _data_loader.create_torch_data_loader(
+        _config.DataConfig(repo_id="fake"),
+        model_config=model_config,
+        action_horizon=4,
+        batch_size=2,
+        framework="pytorch",
+        seed=7,
+        skip_norm_stats=True,
+    )
+
+    assert isinstance(loader, _data_loader.DataLoaderImpl)
+    assert sampler_seeds == [0]
+    assert stream_seeds == [7]
+
+
+def test_chunkflow_awac_pytorch_ddp_uses_independent_sampler_and_stream_seeds(monkeypatch):
+    sampler_seeds, stream_seeds = _capture_pytorch_ddp_seeds(monkeypatch)
+    model_config = pi0_config.Pi0Config(action_horizon=4, overlap_O=2, awac_enable=True)
+
+    loader = _data_loader.create_torch_data_loader(
+        _config.DataConfig(
+            repo_id="fake",
+            awac_executed_action_key="executed_actions",
+            awac_reward_key="rewards",
+            awac_continuation_key="discounts",
+        ),
+        model_config=model_config,
+        action_horizon=4,
+        batch_size=2,
+        framework="pytorch",
+        seed=7,
+        skip_norm_stats=True,
+    )
+
+    assert isinstance(loader, _data_loader.CompositeDataLoader)
+    assert sampler_seeds == [7, 8]
+    assert stream_seeds == [7, 8]
+
+
 def test_transition_fake_dataset_fields_are_awac_only_and_terminal_discount_is_zero():
     disabled = _data_loader.FakeDataset(pi0_config.Pi0Config(action_horizon=4), 2)[1]
     enabled_dataset = _data_loader.FakeDataset(
