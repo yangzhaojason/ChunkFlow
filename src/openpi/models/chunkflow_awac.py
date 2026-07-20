@@ -1,10 +1,15 @@
-"""Pure numerical objectives for step-wise ChunkFlow AWAC."""
+"""Pure numerical objectives for step-wise ChunkFlow AWAC.
+
+Scalar configuration keyword arguments are Python-validated and must remain
+static when these helpers are transformed with :func:`jax.jit`.
+"""
 
 import math
 import numbers
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def _finite_real(value: float, *, name: str) -> float:
@@ -17,6 +22,15 @@ def _finite_real(value: float, *, name: str) -> float:
     return float(value)
 
 
+def _representable_cap(value: float, *, dtype) -> float:
+    dtype = np.dtype(dtype)
+    target = min(value, float(jnp.finfo(dtype).max))
+    rounded = np.asarray(target, dtype=dtype)
+    if float(rounded) > target:
+        rounded = np.nextafter(rounded, np.asarray(-np.inf, dtype=dtype))
+    return float(rounded)
+
+
 def td_targets(
     reward: jax.Array,
     continuation: jax.Array,
@@ -24,7 +38,10 @@ def td_targets(
     *,
     gamma: float,
 ) -> jax.Array:
-    """Return one-step temporal-difference targets."""
+    """Return one-step temporal-difference targets.
+
+    ``gamma`` must be static under :func:`jax.jit`.
+    """
     if reward.ndim != 1 or continuation.shape != reward.shape or next_value.shape != reward.shape:
         raise ValueError("reward, continuation, and next_value must share shape [B]")
     gamma = _finite_real(gamma, name="gamma")
@@ -39,9 +56,14 @@ def expectile_value_loss(
     *,
     expectile: float,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return the mean expectile loss and stopped-Q residual."""
+    """Return the mean expectile loss and stopped-Q residual.
+
+    ``expectile`` must be static under :func:`jax.jit`.
+    """
     if q_value.ndim != 1 or value.shape != q_value.shape:
         raise ValueError("q_value and value must share shape [B]")
+    if q_value.shape[0] == 0:
+        raise ValueError("q_value and value must be non-empty")
     expectile = _finite_real(expectile, name="expectile")
     if not 0.0 < expectile < 1.0:
         raise ValueError("expectile must be within (0, 1)")
@@ -58,7 +80,10 @@ def clipped_advantage_weights(
     temperature: float,
     wmax: float,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return nonnegative exponentially weighted stopped advantages."""
+    """Return nonnegative exponentially weighted stopped advantages.
+
+    ``temperature`` and ``wmax`` must be static under :func:`jax.jit`.
+    """
     if q_value.ndim != 1 or value.shape != q_value.shape:
         raise ValueError("q_value and value must share shape [B]")
     temperature = _finite_real(temperature, name="temperature")
@@ -68,12 +93,20 @@ def clipped_advantage_weights(
     if wmax < 1.0:
         raise ValueError("wmax must be at least 1")
 
+    advantage_dtype = jnp.result_type(q_value.dtype, value.dtype)
+    if not jnp.issubdtype(advantage_dtype, jnp.floating):
+        raise ValueError("q_value and value must produce a floating advantage dtype")
     advantage = jax.lax.stop_gradient(q_value - value)
-    capped_exponent = jnp.minimum(
-        jnp.maximum(advantage, 0.0) / temperature,
-        jnp.log(wmax),
+    effective_cap = jnp.asarray(
+        _representable_cap(wmax, dtype=advantage.dtype),
+        dtype=advantage.dtype,
     )
-    return jnp.exp(capped_exponent), advantage
+    nonpositive = advantage <= 0
+    safe_advantage = jnp.where(nonpositive, jnp.ones_like(advantage), advantage)
+    positive_exponent = jnp.minimum(safe_advantage / temperature, jnp.log(effective_cap))
+    capped_exponent = jnp.where(nonpositive, jnp.zeros_like(advantage), positive_exponent)
+    weights = jnp.minimum(jnp.exp(capped_exponent), effective_cap)
+    return weights, advantage
 
 
 def reference_consistency_loss(
@@ -83,5 +116,7 @@ def reference_consistency_loss(
     """Return mean-square consistency loss against a stopped reference."""
     if current_velocity.shape != reference_velocity.shape:
         raise ValueError("current_velocity and reference_velocity must share shape")
+    if current_velocity.size == 0:
+        raise ValueError("current_velocity and reference_velocity must be non-empty")
     difference = current_velocity - jax.lax.stop_gradient(reference_velocity)
     return jnp.mean(jnp.square(difference))
