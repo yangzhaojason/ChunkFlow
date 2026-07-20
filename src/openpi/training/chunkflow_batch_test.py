@@ -275,6 +275,82 @@ def test_paired_dataset_validates_runtime_action_horizon_for_each_pair_record(
         dataset[0]
 
 
+def test_paired_dataset_rejects_mismatched_pair_horizons_with_zero_history():
+    records = [
+        {"state": np.array([0.0]), "actions": np.zeros((4, 1), dtype=np.float32)},
+        {"state": np.array([2.0]), "actions": np.zeros((5, 1), dtype=np.float32)},
+    ]
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(2, dtype=np.int64),
+        frame_indices=np.array([0, 2]),
+        stride=2,
+        history_length=0,
+    )
+
+    with pytest.raises(ValueError, match="identical shape"):
+        dataset[0]
+
+
+def test_paired_dataset_rejects_mismatched_pair_action_dims_with_zero_history():
+    records = [
+        {"state": np.array([0.0]), "actions": np.zeros((4, 1), dtype=np.float32)},
+        {"state": np.array([2.0]), "actions": np.zeros((4, 2), dtype=np.float32)},
+    ]
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(2, dtype=np.int64),
+        frame_indices=np.array([0, 2]),
+        stride=2,
+        history_length=0,
+    )
+
+    with pytest.raises(ValueError, match="identical shape"):
+        dataset[0]
+
+
+def test_paired_dataset_rejects_mismatched_pair_dtypes_with_zero_history():
+    records = [
+        {"state": np.array([0.0]), "actions": np.zeros((4, 1), dtype=np.float32)},
+        {"state": np.array([2.0]), "actions": np.zeros((4, 1), dtype=np.float64)},
+    ]
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(2, dtype=np.int64),
+        frame_indices=np.array([0, 2]),
+        stride=2,
+        history_length=0,
+    )
+
+    with pytest.raises(ValueError, match="identical dtype"):
+        dataset[0]
+
+
+@pytest.mark.parametrize(
+    ("source_actions", "message"),
+    [
+        (np.zeros((4, 1), dtype=np.float64), r"history source.*dtype"),
+        (np.zeros((3, 1), dtype=np.float32), r"history source.*shape"),
+    ],
+)
+def test_paired_dataset_rejects_incompatible_history_source_chunks(source_actions, message):
+    records = [
+        {"state": np.array([float(frame)]), "actions": np.zeros((4, 1), dtype=np.float32)}
+        for frame in range(5)
+    ]
+    records[1]["actions"] = source_actions
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        stride=2,
+        history_length=1,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        dataset[1]
+
+
 def test_paired_dataset_caches_each_canonical_history_source_per_item():
     records = [
         {

@@ -92,6 +92,10 @@ class PairedTransformedDataset:
             raise KeyError("paired records must contain actions after pre_transforms")
         previous_actions_for_history = self._validate_pair_actions(previous["actions"])
         current_actions_for_history = self._validate_pair_actions(current["actions"])
+        if previous_actions_for_history.shape != current_actions_for_history.shape:
+            raise ValueError("paired previous/current actions must have identical shape [horizon, action_dim]")
+        if previous_actions_for_history.dtype != current_actions_for_history.dtype:
+            raise ValueError("paired previous/current actions must have identical dtype")
         action_cache = {
             self._record_keys[previous_index]: previous_actions_for_history.copy(),
             self._record_keys[current_index]: current_actions_for_history.copy(),
@@ -170,8 +174,10 @@ class PairedTransformedDataset:
                     raise KeyError("history source record must contain actions after pre_transforms")
                 source_actions = np.asarray(source["actions"]).copy()
                 action_cache[source_key] = source_actions
-            if source_actions.ndim != 2 or source_actions.shape[-1] != actions.shape[-1]:
-                raise ValueError("history source actions must match the paired action shape")
+            if source_actions.ndim != 2 or source_actions.shape != actions.shape:
+                raise ValueError("history source actions must match the paired action shape [horizon, action_dim]")
+            if source_actions.dtype != actions.dtype:
+                raise ValueError("history source actions must match the paired action dtype")
             history[position] = source_actions[0]
             history_mask[position] = True
         return history, history_mask
