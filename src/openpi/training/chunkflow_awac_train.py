@@ -47,6 +47,7 @@ def _validate_observation_batch(
     batch_size: int,
     action_dim: int,
     action_horizon: int,
+    history_length: int,
     name: str,
 ) -> None:
     state = getattr(observation, "state", None)
@@ -136,7 +137,13 @@ def _validate_observation_batch(
         raise ValueError(
             f"{name}.action_history and {name}.action_history_mask must be provided together"
         )
-    if history is not None:
+    if history is None:
+        if history_length > 0:
+            raise ValueError(
+                f"{name}.action_history and {name}.action_history_mask are required "
+                f"when history_length={history_length}"
+            )
+    else:
         history_shape = _validate_array_leading_batch(
             history,
             batch_size=batch_size,
@@ -149,15 +156,15 @@ def _validate_observation_batch(
             minimum_rank=2,
             name=f"{name}.action_history_mask",
         )
+        expected_history_shape = (batch_size, history_length, action_dim)
+        expected_history_mask_shape = (batch_size, history_length)
         if (
-            len(history_shape) != 3
-            or history_shape[1] <= 0
-            or history_shape[2] != action_dim
-            or history_mask_shape != history_shape[:2]
+            history_shape != expected_history_shape
+            or history_mask_shape != expected_history_mask_shape
         ):
             raise ValueError(
-                f"{name}.action_history must have shape [B, P, {action_dim}] and "
-                f"{name}.action_history_mask must have shape [B, P], got "
+                f"{name}.action_history must have shape {expected_history_shape} and "
+                f"{name}.action_history_mask must have shape {expected_history_mask_shape}, got "
                 f"{history_shape} and {history_mask_shape}"
             )
 
@@ -215,6 +222,7 @@ def _validate_awac_batch(
     *,
     action_dim: int,
     action_horizon: int,
+    history_length: int,
 ) -> None:
     if not isinstance(batch, chunkflow_batch.ChunkFlowTrainBatch):
         raise ValueError("ChunkFlow AWAC requires a composite supervised/transition batch")
@@ -244,6 +252,7 @@ def _validate_awac_batch(
         batch_size=supervised_batch_size,
         action_dim=action_dim,
         action_horizon=action_horizon,
+        history_length=history_length,
         name="supervised.previous_observation",
     )
     _validate_observation_batch(
@@ -251,6 +260,7 @@ def _validate_awac_batch(
         batch_size=supervised_batch_size,
         action_dim=action_dim,
         action_horizon=action_horizon,
+        history_length=history_length,
         name="supervised.observation",
     )
 
@@ -270,6 +280,7 @@ def _validate_awac_batch(
         batch_size=batch_size,
         action_dim=action_dim,
         action_horizon=action_horizon,
+        history_length=history_length,
         name="transition.observation",
     )
     _validate_observation_batch(
@@ -277,7 +288,28 @@ def _validate_awac_batch(
         batch_size=batch_size,
         action_dim=action_dim,
         action_horizon=action_horizon,
+        history_length=history_length,
         name="transition.next_observation",
+    )
+
+
+def _normalize_disabled_history(
+    batch: chunkflow_batch.ChunkFlowTrainBatch,
+) -> chunkflow_batch.ChunkFlowTrainBatch:
+    def normalize(observation):
+        if observation.action_history is None:
+            return observation
+        return observation.replace(action_history=None, action_history_mask=None)
+
+    return batch.replace(
+        supervised=batch.supervised.replace(
+            previous_observation=normalize(batch.supervised.previous_observation),
+            observation=normalize(batch.supervised.observation),
+        ),
+        transition=batch.transition.replace(
+            observation=normalize(batch.transition.observation),
+            next_observation=normalize(batch.transition.next_observation),
+        ),
     )
 
 
@@ -297,7 +329,10 @@ def compute_awac_objectives(
         batch,
         action_dim=model.action_dim,
         action_horizon=model.action_horizon,
+        history_length=model_config.history_length,
     )
+    if model_config.history_length == 0:
+        batch = _normalize_disabled_history(batch)
     (
         supervised_rng,
         state_rng,
@@ -446,6 +481,7 @@ def train_step(config, rng, state, batch):
         batch,
         action_dim=config.model.action_dim,
         action_horizon=config.model.action_horizon,
+        history_length=config.model.history_length,
     )
 
     model = nnx.merge(state.model_def, state.params)

@@ -22,6 +22,7 @@ class _FlowOutput(NamedTuple):
 class _AwacConfig:
     action_dim: int = 2
     action_horizon: int = 3
+    history_length: int = 0
     awac_gamma: float = 0.9
     awac_expectile_tau_e: float = 0.7
     awac_temperature_tau: float = 0.5
@@ -93,6 +94,68 @@ class _TinyAwacActor:
         loss = jnp.mean(jnp.square(velocity - target_velocity), axis=-1)
         x_t = time[:, None] * noise[:, 0] + (1.0 - time[:, None]) * executed_action
         return _FlowOutput(loss=loss, velocity=velocity, x_t=x_t, time=time)
+
+
+class _HistoryNormalizingActor(_TinyAwacActor):
+    def __init__(self, scale):
+        super().__init__(scale)
+        self.observations_checked = 0
+
+    def _check_observation(self, observation):
+        assert observation.action_history is None
+        assert observation.action_history_mask is None
+        self.observations_checked += 1
+
+    def compute_paired_loss(
+        self,
+        rng,
+        previous_observation,
+        previous_actions,
+        observation,
+        actions,
+        *,
+        ema_model,
+        step,
+        train,
+    ):
+        self._check_observation(previous_observation)
+        self._check_observation(observation)
+        return super().compute_paired_loss(
+            rng,
+            previous_observation,
+            previous_actions,
+            observation,
+            actions,
+            ema_model=ema_model,
+            step=step,
+            train=train,
+        )
+
+    def encode_critic_state(self, rng, observation, *, train):
+        self._check_observation(observation)
+        return super().encode_critic_state(rng, observation, train=train)
+
+    def first_action_flow_forward(
+        self,
+        rng,
+        observation,
+        executed_action,
+        *,
+        train,
+        dummy_tail,
+        noise,
+        time,
+    ):
+        self._check_observation(observation)
+        return super().first_action_flow_forward(
+            rng,
+            observation,
+            executed_action,
+            train=train,
+            dummy_tail=dummy_tail,
+            noise=noise,
+            time=time,
+        )
 
 
 class _TinyCritic:
@@ -186,6 +249,58 @@ def _tiny_composite_batch():
     )
 
 
+def _batch_with_history(batch, history_length):
+    def add_history(observation):
+        batch_size, action_dim = observation.state.shape
+        return observation.replace(
+            action_history=jnp.zeros(
+                (batch_size, history_length, action_dim), dtype=jnp.float32
+            ),
+            action_history_mask=jnp.zeros(
+                (batch_size, history_length), dtype=jnp.bool_
+            ),
+        )
+
+    return batch.replace(
+        supervised=batch.supervised.replace(
+            previous_observation=add_history(batch.supervised.previous_observation),
+            observation=add_history(batch.supervised.observation),
+        ),
+        transition=batch.transition.replace(
+            observation=add_history(batch.transition.observation),
+            next_observation=add_history(batch.transition.next_observation),
+        ),
+    )
+
+
+def _observation_at(batch, role):
+    if role == "supervised.previous_observation":
+        return batch.supervised.previous_observation
+    if role == "supervised.observation":
+        return batch.supervised.observation
+    if role == "transition.observation":
+        return batch.transition.observation
+    if role == "transition.next_observation":
+        return batch.transition.next_observation
+    raise AssertionError(f"unknown observation role: {role}")
+
+
+def _replace_observation_at(batch, role, observation):
+    if role == "supervised.previous_observation":
+        return batch.replace(
+            supervised=batch.supervised.replace(previous_observation=observation)
+        )
+    if role == "supervised.observation":
+        return batch.replace(supervised=batch.supervised.replace(observation=observation))
+    if role == "transition.observation":
+        return batch.replace(transition=batch.transition.replace(observation=observation))
+    if role == "transition.next_observation":
+        return batch.replace(
+            transition=batch.transition.replace(next_observation=observation)
+        )
+    raise AssertionError(f"unknown observation role: {role}")
+
+
 def test_awac_objectives_keep_actor_and_critic_gradients_disjoint():
     batch = _tiny_composite_batch()
 
@@ -277,6 +392,114 @@ def test_awac_objectives_skip_reference_forward_when_coefficient_is_zero():
     assert reference_metric.shape == ()
     assert reference_metric.dtype == jnp.float32
     assert reference_metric == 0
+
+
+def test_awac_objectives_normalize_zero_length_histories_before_model_calls():
+    batch = _batch_with_history(_tiny_composite_batch(), history_length=0)
+    actor = _HistoryNormalizingActor(1.0)
+    reference = _HistoryNormalizingActor(0.75)
+
+    result = compute_awac_objectives(
+        actor,
+        _TinyCritic(2.0, 0.5),
+        _TinyValue(0.25),
+        reference,
+        _TinyAwacActor(1.0),
+        batch,
+        jax.random.key(37),
+        _AwacConfig(history_length=0),
+    )
+
+    assert jnp.isfinite(result.reported_total)
+    assert actor.observations_checked == 5
+    assert reference.observations_checked == 1
+    for role in (
+        "supervised.previous_observation",
+        "supervised.observation",
+        "transition.observation",
+        "transition.next_observation",
+    ):
+        observation = _observation_at(batch, role)
+        assert observation.action_history.shape == (2, 0, 2)
+        assert observation.action_history_mask.shape == (2, 0)
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "supervised.previous_observation",
+        "supervised.observation",
+        "transition.observation",
+        "transition.next_observation",
+    ],
+)
+@pytest.mark.parametrize("violation", ["missing", "wrong_length"])
+def test_awac_objectives_require_configured_history_on_every_observation(role, violation):
+    batch = _batch_with_history(_tiny_composite_batch(), history_length=2)
+    observation = _observation_at(batch, role)
+    if violation == "missing":
+        observation = observation.replace(
+            action_history=None,
+            action_history_mask=None,
+        )
+    else:
+        observation = observation.replace(
+            action_history=jnp.zeros((2, 1, 2), dtype=jnp.float32),
+            action_history_mask=jnp.zeros((2, 1), dtype=jnp.bool_),
+        )
+    batch = _replace_observation_at(batch, role, observation)
+    model = _NeverCalledModel()
+    critic = _NeverCalledCritic()
+
+    with pytest.raises(ValueError, match=rf"{role}.*action_history"):
+        compute_awac_objectives(
+            model,
+            critic,
+            _TinyValue(0.25),
+            _TinyAwacActor(0.75),
+            _TinyAwacActor(1.0),
+            batch,
+            jax.random.key(41),
+            _AwacConfig(history_length=2),
+        )
+
+    assert not model.called
+    assert not critic.called
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "supervised.previous_observation",
+        "supervised.observation",
+        "transition.observation",
+        "transition.next_observation",
+    ],
+)
+def test_awac_objectives_reject_nonzero_history_when_disabled(role):
+    batch = _tiny_composite_batch()
+    observation = _observation_at(batch, role).replace(
+        action_history=jnp.zeros((2, 1, 2), dtype=jnp.float32),
+        action_history_mask=jnp.zeros((2, 1), dtype=jnp.bool_),
+    )
+    batch = _replace_observation_at(batch, role, observation)
+    model = _NeverCalledModel()
+    critic = _NeverCalledCritic()
+
+    with pytest.raises(ValueError, match=rf"{role}.*action_history"):
+        compute_awac_objectives(
+            model,
+            critic,
+            _TinyValue(0.25),
+            _TinyAwacActor(0.75),
+            _TinyAwacActor(1.0),
+            batch,
+            jax.random.key(43),
+            _AwacConfig(history_length=0),
+        )
+
+    assert not model.called
+    assert not critic.called
 
 
 @pytest.mark.parametrize(

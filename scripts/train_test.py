@@ -131,6 +131,8 @@ def _observation(batch_size=2):
         images={},
         image_masks={},
         state=jnp.zeros((batch_size, 1)),
+        action_history=jnp.zeros((batch_size, 1, 1), dtype=jnp.float32),
+        action_history_mask=jnp.ones((batch_size, 1), dtype=jnp.bool_),
     )
 
 
@@ -194,6 +196,8 @@ def _tiny_composite_batch() -> chunkflow_batch.ChunkFlowTrainBatch:
                 images={},
                 image_masks={},
                 state=jnp.asarray([[0.3], [0.1]], dtype=jnp.float32),
+                action_history=jnp.zeros((2, 1, 1), dtype=jnp.float32),
+                action_history_mask=jnp.ones((2, 1), dtype=jnp.bool_),
             ),
             episode_id=jnp.asarray([2, 2], dtype=jnp.int32),
             frame_index=jnp.asarray([4, 5], dtype=jnp.int32),
