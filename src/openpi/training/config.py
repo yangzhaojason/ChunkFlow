@@ -106,6 +106,11 @@ class DataConfig:
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    # Explicit source fields used to assemble strict AWAC step transitions.
+    awac_executed_action_key: str | None = None
+    awac_reward_key: str | None = None
+    awac_continuation_key: str | None = None
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 

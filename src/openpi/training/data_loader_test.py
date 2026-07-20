@@ -119,6 +119,149 @@ def test_torch_loader_emits_paired_chunk_batch_when_supervision_is_enabled():
     np.testing.assert_array_equal(np.asarray(batch.previous_observation.action_history[0]), np.zeros((1, 4)))
 
 
+def test_awac_loader_returns_composite_batch_with_independent_streams():
+    config = pi0_config.Pi0Config(
+        action_dim=4,
+        action_horizon=4,
+        overlap_O=2,
+        history_length=2,
+        awac_enable=True,
+    )
+    data_config = _config.DataConfig(
+        repo_id="fake",
+        awac_executed_action_key="executed_actions",
+        awac_reward_key="rewards",
+        awac_continuation_key="discounts",
+    )
+    loader = _data_loader.create_torch_data_loader(
+        data_config,
+        model_config=config,
+        action_horizon=4,
+        batch_size=2,
+        num_batches=1,
+        skip_norm_stats=True,
+        seed=7,
+    )
+
+    batch = next(iter(loader))
+
+    assert isinstance(batch, chunkflow_batch.ChunkFlowTrainBatch)
+    assert loader.data_config() is data_config
+    assert batch.supervised.actions.shape == (2, 4, 4)
+    assert batch.transition.executed_action.shape == (2, 4)
+    assert batch.transition.reward.shape == (2,)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "awac_executed_action_key",
+        "awac_reward_key",
+        "awac_continuation_key",
+    ],
+)
+def test_composite_loader_rejects_missing_awac_data_key_early_and_specifically(missing):
+    keys = {
+        "awac_executed_action_key": "executed_actions",
+        "awac_reward_key": "rewards",
+        "awac_continuation_key": "discounts",
+    }
+    keys[missing] = None
+    data_config = _config.DataConfig(repo_id="fake", **keys)
+    model_config = pi0_config.Pi0Config(action_horizon=4, overlap_O=2, awac_enable=True)
+
+    with pytest.raises(ValueError, match=missing):
+        _data_loader.create_torch_data_loader(
+            data_config,
+            model_config=model_config,
+            action_horizon=4,
+            batch_size=2,
+            num_batches=1,
+            skip_norm_stats=True,
+        )
+
+
+def test_composite_loader_uses_independent_seeds_for_supervised_and_transition_streams(monkeypatch):
+    seeds = []
+
+    class _CapturingTorchDataLoader:
+        def __init__(self, dataset, **kwargs):
+            del dataset
+            seeds.append(kwargs["seed"])
+
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setattr(_data_loader, "TorchDataLoader", _CapturingTorchDataLoader)
+    model_config = pi0_config.Pi0Config(action_horizon=4, overlap_O=2, awac_enable=True)
+
+    loader = _data_loader.create_torch_data_loader(
+        _config.DataConfig(
+            repo_id="fake",
+            awac_executed_action_key="executed_actions",
+            awac_reward_key="rewards",
+            awac_continuation_key="discounts",
+        ),
+        model_config=model_config,
+        action_horizon=4,
+        batch_size=2,
+        num_batches=1,
+        skip_norm_stats=True,
+        seed=7,
+    )
+
+    assert isinstance(loader, _data_loader.CompositeDataLoader)
+    assert seeds == [7, 8]
+
+
+def test_transition_fake_dataset_fields_are_awac_only_and_terminal_discount_is_zero():
+    disabled = _data_loader.FakeDataset(pi0_config.Pi0Config(action_horizon=4), 2)[1]
+    enabled_dataset = _data_loader.FakeDataset(
+        pi0_config.Pi0Config(action_horizon=4, awac_enable=True),
+        2,
+    )
+    first = enabled_dataset[0]
+    terminal = enabled_dataset[1]
+
+    for key in ("executed_actions", "rewards", "discounts"):
+        assert disabled[key] is None
+        assert first[key] is not None
+    for key in ("episode_index", "frame_index"):
+        assert key not in disabled
+        assert key in first
+    np.testing.assert_array_equal(first["executed_actions"], first["actions"][:1])
+    assert first["discounts"].item() == 1.0
+    assert terminal["discounts"].item() == 0.0
+    assert terminal["episode_index"] == 0
+    assert terminal["frame_index"] == 1
+
+
+def test_awac_data_config_keys_default_to_none():
+    data_config = _config.DataConfig()
+
+    assert data_config.awac_executed_action_key is None
+    assert data_config.awac_reward_key is None
+    assert data_config.awac_continuation_key is None
+
+
+def test_legacy_loader_without_chunkflow_or_awac_keeps_tuple_output():
+    model_config = pi0_config.Pi0Config(action_dim=4, action_horizon=4)
+    loader = _data_loader.create_torch_data_loader(
+        _config.DataConfig(repo_id="fake"),
+        model_config=model_config,
+        action_horizon=4,
+        batch_size=2,
+        num_batches=1,
+        skip_norm_stats=True,
+    )
+
+    batch = next(iter(loader))
+
+    assert isinstance(batch, tuple)
+    assert len(batch) == 2
+    assert batch[1].shape == (2, 4, 4)
+
+
 class _SingleBatchedPairDataset:
     def __iter__(self):
         yield {

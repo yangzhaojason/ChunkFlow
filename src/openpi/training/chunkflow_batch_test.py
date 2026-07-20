@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from openpi.shared import normalize as _normalize
+from openpi.training import chunkflow_batch as _chunkflow_batch
 from openpi.training.chunkflow_batch import PairedChunkBatch
 from openpi.training.chunkflow_batch import PairedTransformedDataset
 from openpi.training.chunkflow_batch import history_from_previous_chunk
@@ -112,6 +113,274 @@ class _CountingDataset(_ListDataset):
     def __getitem__(self, index):
         self.read_counts[index] += 1
         return super().__getitem__(index)
+
+
+def _transition_records():
+    return [
+        {
+            "state": np.array([float(frame)], dtype=np.float32),
+            "actions": np.array([[900.0 + frame]], dtype=np.float32),
+            "executed": np.array([100.0 + frame], dtype=np.float32),
+            "reward": np.float32(frame == 2),
+            "cont": np.float32(frame < 2),
+        }
+        for frame in range(3)
+    ]
+
+
+def _step_transition_dataset(records=None, *, history_length=2, transforms=()):
+    records = _transition_records() if records is None else records
+    return _chunkflow_batch.StepTransitionDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(len(records), dtype=np.int64),
+        frame_indices=np.arange(len(records), dtype=np.int64),
+        history_length=history_length,
+        executed_action_key="executed",
+        reward_key="reward",
+        continuation_key="cont",
+        transforms=transforms,
+    )
+
+
+def test_step_transition_dataset_emits_every_frame_and_terminal_without_crossing_episodes():
+    records = [
+        {"state": np.array([0.0]), "actions": np.array([[10.0]]), "reward": 0.0, "cont": 1.0},
+        {"state": np.array([7.0]), "actions": np.array([[70.0]]), "reward": 0.0, "cont": 1.0},
+        {"state": np.array([1.0]), "actions": np.array([[11.0]]), "reward": 1.0, "cont": 0.0},
+        {"state": np.array([8.0]), "actions": np.array([[71.0]]), "reward": 1.0, "cont": 0.0},
+    ]
+    dataset = _chunkflow_batch.StepTransitionDataset(
+        _ListDataset(records),
+        episode_ids=np.array([0, 1, 0, 1]),
+        frame_indices=np.array([0, 0, 1, 1]),
+        history_length=2,
+        executed_action_key="actions",
+        reward_key="reward",
+        continuation_key="cont",
+    )
+
+    assert len(dataset) == 4
+    first = dataset[0]
+    other_episode = dataset[1]
+    terminal = dataset[2]
+    assert first["episode_id"] == 0
+    assert first["frame_index"] == 0
+    assert first["next_observation"]["state"].item() == 1.0
+    assert other_episode["next_observation"]["state"].item() == 8.0
+    assert terminal["continuation"] == 0.0
+    assert terminal["next_observation"]["state"].item() == terminal["observation"]["state"].item()
+
+
+def test_step_transition_histories_use_only_explicit_executed_actions():
+    dataset = _chunkflow_batch.StepTransitionDataset(
+        _ListDataset(_transition_records()),
+        episode_ids=np.zeros(3, dtype=np.int64),
+        frame_indices=np.arange(3),
+        history_length=2,
+        executed_action_key="executed",
+        reward_key="reward",
+        continuation_key="cont",
+    )
+
+    second = dataset[1]
+
+    np.testing.assert_array_equal(second["observation"]["action_history_mask"], [False, True])
+    np.testing.assert_array_equal(second["observation"]["action_history"], [[0.0], [100.0]])
+    np.testing.assert_array_equal(second["next_observation"]["action_history_mask"], [True, True])
+    np.testing.assert_array_equal(second["next_observation"]["action_history"], [[100.0], [101.0]])
+    np.testing.assert_array_equal(second["executed_action"], [101.0])
+
+
+def test_step_transition_applies_one_action_transform_chain_to_action_and_histories():
+    records = [
+        {"state": np.array([1.0]), "executed": np.array([2.0]), "reward": 0.0, "cont": 1.0},
+        {"state": np.array([3.0]), "executed": np.array([5.0]), "reward": 0.0, "cont": 0.0},
+    ]
+    dataset = _chunkflow_batch.StepTransitionDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(2, dtype=np.int64),
+        frame_indices=np.arange(2),
+        history_length=1,
+        executed_action_key="executed",
+        reward_key="reward",
+        continuation_key="cont",
+        transforms=(
+            _transforms.DeltaActions(mask=[True]),
+            _transforms.PadStatesAndActions(model_action_dim=3),
+        ),
+    )
+
+    second = dataset[1]
+
+    np.testing.assert_array_equal(second["executed_action"], [2.0, 0.0, 0.0])
+    np.testing.assert_array_equal(second["observation"]["action_history"], [[-1.0, 0.0, 0.0]])
+
+
+@pytest.mark.parametrize("missing", ["executed", "reward", "cont"])
+def test_step_transition_rejects_missing_required_field(missing):
+    records = _transition_records()
+    records[0].pop(missing)
+    dataset = _step_transition_dataset(records)
+
+    with pytest.raises((KeyError, ValueError), match=missing):
+        dataset[0]
+
+
+def test_step_transition_rejects_duplicate_episode_frame_keys_at_construction():
+    with pytest.raises(ValueError, match="duplicate"):
+        _chunkflow_batch.StepTransitionDataset(
+            _ListDataset(_transition_records()[:2]),
+            episode_ids=np.array([4, 4]),
+            frame_indices=np.array([7, 7]),
+            history_length=0,
+            executed_action_key="executed",
+            reward_key="reward",
+            continuation_key="cont",
+        )
+
+
+def test_step_transition_requires_nonnegative_history_length():
+    with pytest.raises(ValueError, match="history_length"):
+        _step_transition_dataset(history_length=-1)
+
+
+@pytest.mark.parametrize(
+    ("executed", "expected"),
+    [
+        (np.array([3.0, 4.0]), [3.0, 4.0]),
+        (np.array([[3.0, 4.0], [8.0, 9.0]]), [3.0, 4.0]),
+    ],
+)
+def test_step_transition_accepts_vector_or_nonempty_sequence_executed_action(executed, expected):
+    records = _transition_records()
+    records[0]["executed"] = executed
+    records[1]["executed"] = np.asarray(expected, dtype=np.float64)
+    dataset = _step_transition_dataset(records, history_length=0)
+
+    np.testing.assert_array_equal(dataset[0]["executed_action"], expected)
+
+
+@pytest.mark.parametrize(
+    "executed",
+    [
+        np.array([], dtype=np.float32),
+        np.empty((0, 1), dtype=np.float32),
+        np.array(1.0),
+        np.zeros((1, 1, 1), dtype=np.float32),
+        np.array([np.nan], dtype=np.float32),
+        np.array([1.0 + 1.0j]),
+        np.array([1], dtype=np.int32),
+    ],
+)
+def test_step_transition_rejects_invalid_executed_action(executed):
+    records = _transition_records()
+    records[0]["executed"] = executed
+    dataset = _step_transition_dataset(records, history_length=0)
+
+    with pytest.raises(ValueError, match="executed"):
+        dataset[0]
+
+
+def test_step_transition_accepts_scalar_or_one_element_reward_and_continuation():
+    records = _transition_records()
+    records[0]["reward"] = np.array([2.5])
+    records[0]["cont"] = np.array(0.25)
+
+    transition = _step_transition_dataset(records)[0]
+
+    assert transition["reward"] == 2.5
+    assert transition["continuation"] == 0.25
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reward", np.array([1.0, 2.0])),
+        ("reward", np.nan),
+        ("cont", np.array([0.0, 1.0])),
+        ("cont", np.nan),
+        ("cont", np.inf),
+        ("cont", -0.01),
+        ("cont", 1.01),
+    ],
+)
+def test_step_transition_rejects_invalid_scalar_fields(field, value):
+    records = _transition_records()
+    records[0][field] = value
+    dataset = _step_transition_dataset(records)
+
+    with pytest.raises(ValueError, match=field):
+        dataset[0]
+
+
+def test_step_transition_rejects_missing_next_frame_with_nonzero_continuation():
+    records = [{"state": np.array([0.0]), "executed": np.array([1.0]), "reward": 0.0, "cont": 1.0}]
+
+    with pytest.raises(ValueError, match="continuation"):
+        _step_transition_dataset(records, history_length=0)[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("executed_actions", np.zeros((1, 1, 1)), "executed"),
+        ("action_history", np.zeros((1, 1, 1)), "history"),
+        ("action_history", np.zeros((1, 2)), "shape"),
+        ("executed_actions", np.array([[np.inf]]), "finite"),
+        ("state", np.array([np.nan]), "finite"),
+    ],
+)
+def test_step_transition_validates_transformed_shapes_and_floating_leaves(field, value, message):
+    def corrupt(data):
+        return {**data, field: value}
+
+    dataset = _step_transition_dataset(history_length=1, transforms=(corrupt,))
+
+    with pytest.raises(ValueError, match=message):
+        dataset[0]
+
+
+def test_step_transition_terminal_history_shifts_and_appends_current_action():
+    terminal = _step_transition_dataset()[2]
+
+    np.testing.assert_array_equal(terminal["observation"]["action_history"], [[100.0], [101.0]])
+    np.testing.assert_array_equal(terminal["next_observation"]["action_history"], [[101.0], [102.0]])
+    np.testing.assert_array_equal(terminal["next_observation"]["action_history_mask"], [True, True])
+
+
+def test_step_transition_pretransforms_canonicalize_without_mutating_source_records():
+    records = [
+        {
+            "raw_state": np.array([1.0]),
+            "raw_targets": np.array([[9.0]]),
+            "raw_executed": np.array([2.0]),
+            "reward": 0.0,
+            "cont": 0.0,
+        }
+    ]
+    original = {key: value.copy() if isinstance(value, np.ndarray) else value for key, value in records[0].items()}
+    dataset = _chunkflow_batch.StepTransitionDataset(
+        _ListDataset(records),
+        episode_ids=np.array([0]),
+        frame_indices=np.array([0]),
+        history_length=1,
+        executed_action_key="raw_executed",
+        reward_key="reward",
+        continuation_key="cont",
+        pre_transforms=(
+            _transforms.RepackTransform({"state": "raw_state", "actions": "raw_targets"}),
+        ),
+    )
+
+    transition = dataset[0]
+
+    np.testing.assert_array_equal(transition["observation"]["state"], [1.0])
+    assert "raw_executed" not in transition["observation"]
+    for key, value in original.items():
+        if isinstance(value, np.ndarray):
+            np.testing.assert_array_equal(records[0][key], value)
+        else:
+            assert records[0][key] == value
 
 
 def test_paired_transformed_dataset_attaches_raw_history_before_action_transforms():

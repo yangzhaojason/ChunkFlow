@@ -28,7 +28,12 @@ from openpi.training.truth_rlds_dataset import TruthRldsDatasetJointWithoutGripp
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
-TrainingBatch = tuple[_model.Observation, _model.Actions] | _chunkflow_batch.PairedChunkBatch
+TrainingBatch = (
+    tuple[_model.Observation, _model.Actions]
+    | _chunkflow_batch.PairedChunkBatch
+    | _chunkflow_batch.StepTransitionBatch
+    | _chunkflow_batch.ChunkFlowTrainBatch
+)
 
 # Type alias for all supported RLDS dataset types
 RLDSDatasetType = (
@@ -103,6 +108,30 @@ class DataLoader(Protocol[T_co]):
     def __iter__(self) -> Iterator[T_co]:
         raise NotImplementedError(
             "Subclasses of DataLoader should implement __iter__.")
+
+
+class CompositeDataLoader(DataLoader[_chunkflow_batch.ChunkFlowTrainBatch]):
+    """Zip independently sampled, already typed supervised and transition streams."""
+
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        supervised_loader: DataLoader[_chunkflow_batch.PairedChunkBatch],
+        transition_loader: DataLoader[_chunkflow_batch.StepTransitionBatch],
+    ):
+        self._data_config = data_config
+        self._supervised_loader = supervised_loader
+        self._transition_loader = transition_loader
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+
+    def __iter__(self) -> Iterator[_chunkflow_batch.ChunkFlowTrainBatch]:
+        for supervised, transition in zip(self._supervised_loader, self._transition_loader, strict=False):
+            yield _chunkflow_batch.ChunkFlowTrainBatch(
+                supervised=supervised,
+                transition=transition,
+            )
 
 
 class TransformedDataset(Dataset[T_co]):
@@ -227,9 +256,11 @@ class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples
         self._observation_spec, self._action_spec = model_config.inputs_spec()
+        self._awac_enable = bool(getattr(model_config, "awac_enable", False))
 
     def __getitem__(self, index: SupportsIndex) -> dict:
-        rng = jax.random.key(index.__index__())
+        record_index = index.__index__()
+        rng = jax.random.key(record_index)
 
         def make_from_spec(spec: jax.ShapeDtypeStruct):
             nonlocal rng
@@ -245,10 +276,19 @@ class FakeDataset(Dataset):
         observation = jax.tree.map(make_from_spec, self._observation_spec)
         action = jax.tree.map(make_from_spec, self._action_spec)
 
-        return {
+        item = {
             **observation.to_dict(),
             "actions": action,
         }
+        if self._awac_enable:
+            item.update(
+                executed_actions=np.array(action[:1], copy=True),
+                rewards=np.zeros((1,), dtype=np.float32),
+                discounts=np.array([record_index < self._num_samples - 1], dtype=np.float32),
+                episode_index=np.int32(0),
+                frame_index=np.int32(record_index),
+            )
+        return item
 
     def __len__(self) -> int:
         return self._num_samples
@@ -470,68 +510,104 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    if bool(getattr(model_config, "chunkflow_supervised_enabled", False)):
-        episode_ids, frame_indices = _episode_frame_arrays(dataset)
-        stride = int(
-            getattr(
-                model_config,
-                "chunk_stride",
-                action_horizon - int(getattr(model_config, "overlap_O", 0)),
-            )
+
+    def _build_torch_stream_loader(stream_dataset, *, stream_seed: int) -> TorchDataLoader:
+        # Use TorchDataLoader for both frameworks. PyTorch DDP owns shuffling through
+        # its sampler; JAX divides the global batch across processes.
+        sampler = None
+        if framework == "pytorch":
+            if torch.distributed.is_initialized():
+                sampler = torch.utils.data.distributed.DistributedSampler(
+                    stream_dataset,
+                    num_replicas=torch.distributed.get_world_size(),
+                    rank=torch.distributed.get_rank(),
+                    shuffle=shuffle,
+                    seed=stream_seed,
+                    drop_last=True,
+                )
+                local_batch_size = batch_size // torch.distributed.get_world_size()
+            else:
+                local_batch_size = batch_size
+        else:
+            local_batch_size = batch_size // jax.process_count()
+
+        logging.info(f"local_batch_size: {local_batch_size}")
+        return TorchDataLoader(
+            stream_dataset,
+            local_batch_size=local_batch_size,
+            sharding=None if framework == "pytorch" else sharding,
+            shuffle=(sampler is None and shuffle),
+            sampler=sampler,
+            num_batches=num_batches,
+            num_workers=num_workers,
+            seed=stream_seed,
+            framework=framework,
         )
-        history_length = int(getattr(model_config, "history_length", 0))
-        pre_transforms, transforms = _input_transforms(
-            data_config, skip_norm_stats=skip_norm_stats
-        )
-        dataset = _chunkflow_batch.PairedTransformedDataset(
-            dataset,
-            episode_ids=episode_ids,
-            frame_indices=frame_indices,
-            stride=stride,
-            history_length=history_length,
-            action_horizon=action_horizon,
-            pre_transforms=pre_transforms,
-            transforms=transforms,
-        )
-    else:
-        dataset = transform_dataset(
+
+    training_enabled = bool(getattr(model_config, "chunkflow_training_enabled", False))
+    if not training_enabled:
+        legacy_dataset = transform_dataset(
             dataset, data_config, skip_norm_stats=skip_norm_stats
         )
+        return DataLoaderImpl(
+            data_config,
+            _build_torch_stream_loader(legacy_dataset, stream_seed=seed),
+        )
 
-    # Use TorchDataLoader for both frameworks
-    # For PyTorch DDP, create DistributedSampler and divide batch size by world size
-    # For JAX, divide by process count
-    sampler = None
-    if framework == "pytorch":
-        if torch.distributed.is_initialized():
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset,
-                num_replicas=torch.distributed.get_world_size(),
-                rank=torch.distributed.get_rank(),
-                shuffle=shuffle,
-                drop_last=True,
-            )
-            local_batch_size = batch_size // torch.distributed.get_world_size()
-        else:
-            local_batch_size = batch_size
-    else:
-        local_batch_size = batch_size // jax.process_count()
-
-    logging.info(f"local_batch_size: {local_batch_size}")
-    data_loader = TorchDataLoader(
+    episode_ids, frame_indices = _episode_frame_arrays(dataset)
+    stride = int(
+        getattr(
+            model_config,
+            "chunk_stride",
+            action_horizon - int(getattr(model_config, "overlap_O", 0)),
+        )
+    )
+    history_length = int(getattr(model_config, "history_length", 0))
+    pre_transforms, transforms = _input_transforms(
+        data_config, skip_norm_stats=skip_norm_stats
+    )
+    supervised_dataset = _chunkflow_batch.PairedTransformedDataset(
         dataset,
-        local_batch_size=local_batch_size,
-        sharding=None if framework == "pytorch" else sharding,
-        # Don't shuffle if using sampler
-        shuffle=(sampler is None and shuffle),
-        sampler=sampler,
-        num_batches=num_batches,
-        num_workers=num_workers,
-        seed=seed,
-        framework=framework,
+        episode_ids=episode_ids,
+        frame_indices=frame_indices,
+        stride=stride,
+        history_length=history_length,
+        action_horizon=action_horizon,
+        pre_transforms=pre_transforms,
+        transforms=transforms,
+    )
+    supervised_loader = DataLoaderImpl(
+        data_config,
+        _build_torch_stream_loader(supervised_dataset, stream_seed=seed),
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    if not bool(getattr(model_config, "awac_enable", False)):
+        return supervised_loader
+
+    for field_name in (
+        "awac_executed_action_key",
+        "awac_reward_key",
+        "awac_continuation_key",
+    ):
+        if getattr(data_config, field_name) is None:
+            raise ValueError(f"{field_name} must be configured when AWAC is enabled")
+
+    transition_dataset = _chunkflow_batch.StepTransitionDataset(
+        dataset,
+        episode_ids=episode_ids,
+        frame_indices=frame_indices,
+        history_length=history_length,
+        executed_action_key=typing.cast(str, data_config.awac_executed_action_key),
+        reward_key=typing.cast(str, data_config.awac_reward_key),
+        continuation_key=typing.cast(str, data_config.awac_continuation_key),
+        pre_transforms=pre_transforms,
+        transforms=transforms,
+    )
+    transition_loader = DataLoaderImpl(
+        data_config,
+        _build_torch_stream_loader(transition_dataset, stream_seed=seed + 1),
+    )
+    return CompositeDataLoader(data_config, supervised_loader, transition_loader)
 
 
 def create_rlds_data_loader(
@@ -864,6 +940,16 @@ class DataLoaderImpl(DataLoader):
                     observation=_model.Observation.from_dict(batch["observation"]),
                     actions=batch["actions"],
                     step=batch["step"],
+                )
+            elif "next_observation" in batch:
+                yield _chunkflow_batch.StepTransitionBatch(
+                    observation=_model.Observation.from_dict(batch["observation"]),
+                    executed_action=batch["executed_action"],
+                    reward=batch["reward"],
+                    continuation=batch["continuation"],
+                    next_observation=_model.Observation.from_dict(batch["next_observation"]),
+                    episode_id=batch["episode_id"],
+                    frame_index=batch["frame_index"],
                 )
             else:
                 yield _model.Observation.from_dict(batch), batch["actions"]

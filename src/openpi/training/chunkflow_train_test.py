@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 import pytest
 
+from openpi.training import chunkflow_batch as _chunkflow_batch
 from openpi.training.chunkflow_batch import PairedChunkBatch
 from openpi.training.chunkflow_train import batch_observation
 from openpi.training.chunkflow_train import batch_with_step
@@ -124,3 +125,30 @@ def test_legacy_batch_observation_is_unchanged():
     observation = {"state": jnp.array([2.0])}
 
     assert batch_observation((observation, jnp.zeros((1, 2, 1)))) is observation
+
+
+def test_composite_batch_uses_supervised_observation_and_replaces_only_supervised_step():
+    supervised = PairedChunkBatch(
+        previous_observation={"state": jnp.array([0.0])},
+        previous_actions=jnp.zeros((1, 2, 1)),
+        observation={"state": jnp.array([3.0])},
+        actions=jnp.ones((1, 2, 1)),
+        step=jnp.array(0, dtype=jnp.int32),
+    )
+    transition = _chunkflow_batch.StepTransitionBatch(
+        observation={"state": jnp.array([4.0])},
+        executed_action=jnp.array([[5.0]]),
+        reward=jnp.array([1.0]),
+        continuation=jnp.array([0.0]),
+        next_observation={"state": jnp.array([6.0])},
+        episode_id=jnp.array([7], dtype=jnp.int32),
+        frame_index=jnp.array([8], dtype=jnp.int32),
+    )
+    batch = _chunkflow_batch.ChunkFlowTrainBatch(supervised=supervised, transition=transition)
+
+    prepared = batch_with_step(batch, jnp.array(9, dtype=jnp.int32))
+
+    assert batch_observation(prepared)["state"].item() == 3.0
+    assert prepared.supervised.step.item() == 9
+    assert prepared.transition is transition
+    assert batch.supervised.step.item() == 0
