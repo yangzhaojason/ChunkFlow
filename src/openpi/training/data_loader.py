@@ -550,6 +550,7 @@ def create_torch_data_loader(
         )
 
     training_enabled = bool(getattr(model_config, "chunkflow_training_enabled", False))
+    awac_enabled = bool(getattr(model_config, "awac_enable", False))
     if not training_enabled:
         legacy_dataset = transform_dataset(
             dataset, data_config, skip_norm_stats=skip_norm_stats
@@ -586,11 +587,11 @@ def create_torch_data_loader(
         _build_torch_stream_loader(
             supervised_dataset,
             stream_seed=seed,
-            sampler_seed=seed,
+            sampler_seed=seed if awac_enabled else 0,
         ),
     )
 
-    if not bool(getattr(model_config, "awac_enable", False)):
+    if not awac_enabled:
         return supervised_loader
 
     for field_name in (

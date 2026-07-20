@@ -262,6 +262,31 @@ def test_legacy_pytorch_ddp_preserves_default_sampler_seed_and_requested_stream_
     assert stream_seeds == [7]
 
 
+def test_supervised_only_chunkflow_pytorch_ddp_preserves_default_sampler_seed(monkeypatch):
+    sampler_seeds, stream_seeds = _capture_pytorch_ddp_seeds(monkeypatch)
+    model_config = pi0_config.Pi0Config(
+        action_dim=4,
+        action_horizon=4,
+        overlap_O=2,
+        history_length=2,
+        awac_enable=False,
+    )
+
+    loader = _data_loader.create_torch_data_loader(
+        _config.DataConfig(repo_id="fake"),
+        model_config=model_config,
+        action_horizon=4,
+        batch_size=2,
+        framework="pytorch",
+        seed=7,
+        skip_norm_stats=True,
+    )
+
+    assert isinstance(loader, _data_loader.DataLoaderImpl)
+    assert sampler_seeds == [0]
+    assert stream_seeds == [7]
+
+
 def test_chunkflow_awac_pytorch_ddp_uses_independent_sampler_and_stream_seeds(monkeypatch):
     sampler_seeds, stream_seeds = _capture_pytorch_ddp_seeds(monkeypatch)
     model_config = pi0_config.Pi0Config(action_horizon=4, overlap_O=2, awac_enable=True)
