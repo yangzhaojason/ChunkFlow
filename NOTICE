@@ -1,0 +1,12 @@
+ChunkFlow
+
+This distribution includes software derived from Physical Intelligence's openpi
+project: https://github.com/Physical-Intelligence/openpi
+
+The inherited openpi source and the ChunkFlow modifications are distributed
+under the Apache License 2.0 (Apache-2.0). The original notices and license
+headers in individual source files remain applicable.
+
+Additional embedded-source attribution is recorded in THIRD_PARTY_NOTICES.md.
+Those notices and the corresponding source-file headers must be retained in
+redistributions where required by the applicable license.

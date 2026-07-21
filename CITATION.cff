@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you use ChunkFlow, please cite the conference paper below."
+type: software
+title: "ChunkFlow"
+authors:
+  - family-names: Yang
+    given-names: Zhao
+  - family-names: Shi
+    given-names: Yinan
+  - family-names: Yao
+    given-names: Mingyuan
+  - family-names: Xue
+    given-names: Wenyao
+  - family-names: Jueluo
+    given-names: Yawei
+  - family-names: Liu
+    given-names: Longjun
+repository-code: https://github.com/yangzhaojason/ChunkFlow
+url: https://cytoderm-ai.github.io/chunkflow/
+license: Apache-2.0
+preferred-citation:
+  type: conference-paper
+  title: "ChunkFlow: Towards Continuity-Consistent Chunked Policy Learning"
+  authors:
+    - family-names: Yang
+      given-names: Zhao
+    - family-names: Shi
+      given-names: Yinan
+    - family-names: Yao
+      given-names: Mingyuan
+    - family-names: Xue
+      given-names: Wenyao
+    - family-names: Jueluo
+      given-names: Yawei
+    - family-names: Liu
+      given-names: Longjun
+  collection-title: "IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)"
+  year: 2026

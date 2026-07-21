@@ -177,6 +177,9 @@ third_party/
 outputs/
 results/
 
+# Local paper-review and release-audit artifacts at the repository root
+/tmp/
+
 # Model, dataset, and result artifacts
 *.avi
 *.bin
