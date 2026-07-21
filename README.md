@@ -141,10 +141,12 @@ serving and evaluation `checkpoint-dir` values must point to the step root
 
 ## Inference and evaluation
 
-### Policy server
+### Raw actor policy server
 
-Start the standard openpi WebSocket policy server with the AWAC actor. The
-critic is not loaded for inference.
+The standard openpi WebSocket command below loads the AWAC actor with
+`create_trained_policy`. It is a raw actor policy server: it does not perform
+overlap blending and does not maintain executed history, so it is not a complete
+ChunkFlow RTC runtime. The critic is not loaded for inference.
 
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint \
@@ -152,8 +154,38 @@ uv run scripts/serve_policy.py policy:checkpoint \
   --policy.dir=checkpoints/pi05_chunkflow_paper_awac/chunkflow_awac/29999
 ```
 
-Client integration and process separation are covered by
-[remote inference](docs/remote_inference.md).
+For local stateful execution, wrap that trained actor with the repository's RTC
+policy and reset it at every episode boundary:
+
+```python
+from openpi.policies import policy_config
+from openpi.policies.rtc_policy import RTCConfig, RTCPolicy
+from openpi.training import config as _config
+
+config = _config.get_config("pi05_chunkflow_paper_awac")
+checkpoint_dir = "checkpoints/pi05_chunkflow_paper_awac/chunkflow_awac/29999"
+base = policy_config.create_trained_policy(config, checkpoint_dir)
+rtc_config = RTCConfig.from_model_config(
+    config.model,
+    overlap_size=8,
+    replan_interval=2,
+    blending_method="linear",
+    track_metrics=True,
+)
+rtc_policy = RTCPolicy(base, rtc_config)
+
+
+def run_episode(observations):
+    rtc_policy.reset()
+    for observation in observations:
+        yield rtc_policy.infer(observation)["actions"]
+```
+
+The ready-made complete RTC benchmark paths are the CALVIN and LIBERO wrappers
+below. For remote deployment, keep `RTCPolicy` episode state in the robot control
+loop or in a stateful service. A raw actor WebSocket client that does not wrap
+the actor with RTC is not equivalent to ChunkFlow RTC. Transport and client
+integration details are covered by [remote inference](docs/remote_inference.md).
 
 ### CALVIN
 
@@ -166,7 +198,9 @@ CALVIN_DATASET=datasets/calvin/task_D_D \
 CHUNKFLOW_CHECKPOINT=checkpoints/pi05_chunkflow_paper_awac/chunkflow_awac/29999 \
 CHUNKFLOW_CONFIG=pi05_chunkflow_paper_awac \
 CALVIN_OUTPUT_DIR=outputs/calvin/chunkflow \
-bash eval_code/eval_calvin_chunkflow.sh
+bash eval_code/eval_calvin_chunkflow.sh \
+  --overlap-size 8 \
+  --replan-interval 2
 ```
 
 The launcher also accepts `CALVIN_NUM_SEQUENCES` and `PYTHON_BIN`. It does not
@@ -182,12 +216,15 @@ uv run python eval_code/pi05_rtc_libero_eval.py \
   --config pi05_chunkflow_paper_awac \
   --checkpoint-dir checkpoints/pi05_chunkflow_paper_awac/chunkflow_awac/29999 \
   --task-suite-name libero_10 \
-  --output-dir outputs/libero/chunkflow
+  --output-dir outputs/libero/chunkflow \
+  --overlap-size 8 \
+  --replan-interval 2
 ```
 
-Adjust `--task-suite-name`, trial count, overlap, and replanning arguments for
-the installed benchmark version. The upstream-style Docker workflow remains in
-the [LIBERO example](examples/libero/README.md).
+Both benchmark commands explicitly match the paper config's `O=8` and `S=2`
+(`replan_interval=2`) instead of inheriting the evaluator defaults. Adjust
+`--task-suite-name` and trial count for the installed benchmark version. The
+upstream-style Docker workflow remains in the [LIBERO example](examples/libero/README.md).
 
 ### Action smoothness
 

@@ -13,6 +13,19 @@ def _read(relative_path: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _markdown_section(markdown: str, heading: str, next_heading: str) -> str:
+    assert heading in markdown, f"missing README section: {heading}"
+    section = markdown.split(heading, maxsplit=1)[1]
+    assert next_heading in section, f"missing README section after {heading}: {next_heading}"
+    return section.split(next_heading, maxsplit=1)[0]
+
+
+def _fenced_block(section: str, language: str) -> str:
+    match = re.search(rf"```{language}\n(.*?)\n```", section, flags=re.DOTALL)
+    assert match is not None, f"missing {language} fenced block"
+    return match.group(1)
+
+
 def test_readme_identifies_chunkflow_paper_and_authors() -> None:
     readme = _read("README.md")
 
@@ -106,6 +119,58 @@ def test_readme_uses_step_root_for_serving_and_evaluation() -> None:
     assert "assets/" in readme
     for match in re.finditer(r"--(?:policy\.dir|checkpoint-dir)(?:=|\s+)(\S+)", readme):
         assert not match.group(1).rstrip("/\\").endswith("params")
+
+
+def test_readme_paper_rtc_benchmark_commands_override_script_defaults() -> None:
+    readme = _read("README.md")
+    calvin = _markdown_section(readme, "### CALVIN", "### LIBERO")
+    libero = _markdown_section(readme, "### LIBERO", "### Action smoothness")
+    commands = (
+        (_fenced_block(calvin, "bash"), "bash eval_code/eval_calvin_chunkflow.sh"),
+        (_fenced_block(libero, "bash"), "eval_code/pi05_rtc_libero_eval.py"),
+    )
+
+    for command, entry_point in commands:
+        assert entry_point in command
+        assert "--overlap-size 8" in command
+        assert "--replan-interval 2" in command
+
+
+def test_readme_distinguishes_raw_server_from_stateful_rtc_execution() -> None:
+    readme = _read("README.md")
+    section = _markdown_section(readme, "### Raw actor policy server", "### CALVIN")
+    lowered = " ".join(section.lower().split())
+
+    assert "raw actor" in lowered
+    assert "does not perform overlap blending" in lowered
+    assert "does not maintain executed history" in lowered
+    assert "not a complete chunkflow rtc runtime" in lowered
+    assert "calvin and libero wrappers below" in lowered
+    assert "episode state" in lowered
+    assert "control loop" in lowered
+    assert "stateful service" in lowered
+    assert "raw actor websocket client" in lowered
+    assert "not equivalent" in lowered
+
+    example = _fenced_block(section, "python")
+    compile(example, "README RTCPolicy example", "exec")
+    for value in (
+        "from openpi.policies import policy_config",
+        "from openpi.policies.rtc_policy import RTCConfig, RTCPolicy",
+        "from openpi.training import config as _config",
+        'config = _config.get_config("pi05_chunkflow_paper_awac")',
+        "base = policy_config.create_trained_policy(config, checkpoint_dir)",
+        "rtc_config = RTCConfig.from_model_config(",
+        "config.model",
+        "overlap_size=8",
+        "replan_interval=2",
+        'blending_method="linear"',
+        "track_metrics=True",
+        "rtc_policy = RTCPolicy(base, rtc_config)",
+        "rtc_policy.reset()",
+        "rtc_policy.infer(observation)",
+    ):
+        assert value in example
 
 
 def test_readme_documents_real_evaluation_entry_points_and_external_assets() -> None:
