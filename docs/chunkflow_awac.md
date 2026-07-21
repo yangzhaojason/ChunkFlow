@@ -53,7 +53,7 @@ For the same reason, `kl_beta * reference_consistency` is the explicit Equation 
 
 The target V parameters follow an EMA of the updated online V parameters. This is a numerical-stability extension to Equation (12), not a claim about an additional paper equation. Exact flow entropy is unsupported; any nonzero `entropy_lambda` is rejected rather than silently ignored.
 
-Equation (15) maps to the retained full-chunk structural regularization: first-order total variation/continuity, second-order curvature, and stopped adjacent-chunk boundary alignment. The full supervised flow/BC loss remains alongside those Equation (15) terms as the imitation anchor; it is not presented here as mathematically part of Equation (15). The reported actor objective also adds the weighted first-action surrogate and reference consistency. Q and V have a separate optimizer objective. Their features are stop-gradient actor features, and the critic is omitted from inference.
+The first-order total-variation/continuity and second-order curvature terms directly implement Equation (15). boundary_consistency_loss uses stopped, target-relative residual seam alignment and is explicitly an implementation surrogate/extension. When paired overlap targets share the same coordinate frame, as in canonical LIBERO, it reduces to the paper's raw seam term; for state-relative action transforms, the residual form avoids penalizing coordinate-origin shifts. The full supervised flow/BC loss remains alongside this structural regularization as the imitation anchor; it is not presented here as mathematically part of Equation (15). The reported actor objective also adds the weighted first-action surrogate and reference consistency. Q and V have a separate optimizer objective. Their features are stop-gradient actor features, and the critic is omitted from inference.
 
 ## Canonical paper configuration
 
@@ -67,13 +67,20 @@ Import-time environment controls are:
 CHUNKFLOW_PAPER_REPO_ID=chunkflow/libero
 CHUNKFLOW_PAPER_DATASET_ROOT=datasets/chunkflow_lerobot
 CHUNKFLOW_SUPERVISED_CHECKPOINT=checkpoints/pi05_chunkflow_paper_bc/chunkflow_bc/29999/params
+CHUNKFLOW_SUPERVISED_ASSETS=checkpoints/pi05_chunkflow_paper_bc/chunkflow_bc/29999/assets
 ```
 
-`CHUNKFLOW_PI05_BASE_CHECKPOINT` selects the Pi0.5 initialization for supervised training. `CHUNKFLOW_SUPERVISED_CHECKPOINT` is a weight load into a new AWAC run: it initializes the actor, then creates fresh critic/target state and freezes the loaded actor as the reference. This differs from resuming an existing AWAC checkpoint, which restores all AWAC training state.
+`CHUNKFLOW_PI05_BASE_CHECKPOINT` selects the Pi0.5 initialization for supervised training. `CHUNKFLOW_SUPERVISED_CHECKPOINT` is a weight load into a new AWAC run: it initializes the actor, then creates fresh critic/target state and freezes the loaded actor as the reference. `CHUNKFLOW_SUPERVISED_ASSETS` selects that supervised run's normalization assets. By default it is derived as the checkpoint's sibling `assets` directory; set it explicitly when weights and assets do not share the canonical checkpoint layout. This differs from resuming an existing AWAC checkpoint, which restores all AWAC training state.
 
 ## JAX training commands
 
-Supervised behavior cloning:
+First compute normalization statistics under the BC config's local assets directory, `assets/pi05_chunkflow_paper_bc`:
+
+```bash
+uv run scripts/compute_norm_stats.py --config-name pi05_chunkflow_paper_bc
+```
+
+Then run supervised behavior cloning:
 
 ```bash
 uv run scripts/train.py pi05_chunkflow_paper_bc --exp-name chunkflow_bc --overwrite
@@ -86,10 +93,12 @@ CHUNKFLOW_SUPERVISED_CHECKPOINT=checkpoints/pi05_chunkflow_paper_bc/chunkflow_bc
   uv run scripts/train.py pi05_chunkflow_paper_awac --exp-name chunkflow_awac --overwrite
 ```
 
+Checkpoint saving copies the BC normalization statistics into each checkpoint step's sibling `assets` directory. The canonical AWAC config reuses the supervised checkpoint's copy instead of reading or creating `assets/pi05_chunkflow_paper_awac`. If the assets were copied elsewhere, set `CHUNKFLOW_SUPERVISED_ASSETS` explicitly alongside `CHUNKFLOW_SUPERVISED_CHECKPOINT`.
+
 Resume a complete AWAC run:
 
 ```bash
 uv run scripts/train.py pi05_chunkflow_paper_awac --exp-name chunkflow_awac --resume
 ```
 
-All three commands launch the JAX trainer. `scripts/train_pytorch.py` rejects AWAC before constructing a dataset or loader.
+All three training commands launch the JAX trainer. `scripts/train_pytorch.py` rejects AWAC before constructing a dataset or loader.

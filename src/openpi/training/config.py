@@ -44,6 +44,10 @@ CHUNKFLOW_SUPERVISED_CHECKPOINT = os.environ.get(
     "CHUNKFLOW_SUPERVISED_CHECKPOINT",
     "checkpoints/pi05_chunkflow_paper_bc/chunkflow_bc/29999/params",
 )
+CHUNKFLOW_SUPERVISED_ASSETS = os.environ.get(
+    "CHUNKFLOW_SUPERVISED_ASSETS",
+    f"{CHUNKFLOW_SUPERVISED_CHECKPOINT.rsplit('/', 1)[0]}/assets",
+)
 CHUNKFLOW_REAL_JOINT_STAGE1_CHECKPOINT = os.environ.get(
     "CHUNKFLOW_REAL_JOINT_STAGE1_CHECKPOINT", "checkpoints/chunkflow_real_joint_stage1/params"
 )
@@ -1047,6 +1051,7 @@ _CONFIGS = [
         data=LeRobotLiberoDataConfig(
             repo_id=CHUNKFLOW_PAPER_REPO_ID,
             lerobot_root=CHUNKFLOW_PAPER_DATASET_ROOT,
+            assets=AssetsConfig(assets_dir=CHUNKFLOW_SUPERVISED_ASSETS),
             base_config=DataConfig(
                 prompt_from_task=True,
                 awac_executed_action_key="actions",

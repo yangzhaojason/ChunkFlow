@@ -343,6 +343,9 @@ def train_loop(config: _config.TrainConfig):
     - 循环执行前向/反向、梯度裁剪与优化步，记录日志并定期保存检查点
     - 训练结束后清理资源与结束 wandb 运行
     """
+    if bool(getattr(config.model, "awac_enable", False)):
+        raise NotImplementedError("ChunkFlow AWAC training is supported only by the JAX trainer")
+
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
