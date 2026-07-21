@@ -86,8 +86,18 @@ EXPECTED_ENV_DEFAULTS = {
     "CHUNKFLOW_LIBERO_DATASET": "datasets/libero_lerobot",
     "CHUNKFLOW_REAL_DATA_DIR": "datasets/real_robot",
     "CHUNKFLOW_PI05_BASE_CHECKPOINT": "gs://openpi-assets/checkpoints/pi05_base/params",
+    "CHUNKFLOW_PAPER_REPO_ID": "chunkflow/libero",
+    "CHUNKFLOW_PAPER_DATASET_ROOT": "datasets/chunkflow_lerobot",
+    "CHUNKFLOW_SUPERVISED_CHECKPOINT": "checkpoints/pi05_chunkflow_paper_bc/chunkflow_bc/29999/params",
     "CHUNKFLOW_REAL_JOINT_STAGE1_CHECKPOINT": "checkpoints/chunkflow_real_joint_stage1/params",
     "CHUNKFLOW_REAL_JOINT_STAGE2_CHECKPOINT": "checkpoints/chunkflow_real_joint_stage2/params",
+}
+
+EXPECTED_DERIVED_ENV_DEFAULTS = {
+    "CHUNKFLOW_SUPERVISED_ASSETS": (
+        'os.environ.get("CHUNKFLOW_SUPERVISED_ASSETS", '
+        'f"{CHUNKFLOW_SUPERVISED_CHECKPOINT.rsplit(\'/\', 1)[0]}/assets")'
+    ),
 }
 
 EXPECTED_REAL_CONFIGS = {
@@ -508,7 +518,8 @@ class PortabilityTest(unittest.TestCase):
             and isinstance(node.targets[0], ast.Name)
             and node.targets[0].id.startswith("CHUNKFLOW_")
         }
-        if set(environment_assignments) != set(EXPECTED_ENV_DEFAULTS):
+        expected_environment_names = set(EXPECTED_ENV_DEFAULTS) | set(EXPECTED_DERIVED_ENV_DEFAULTS)
+        if set(environment_assignments) != expected_environment_names:
             failures.append(
                 f"environment constants are {sorted(environment_assignments)!r}"
             )
@@ -526,6 +537,14 @@ class PortabilityTest(unittest.TestCase):
                 or value.keywords
             ):
                 failures.append(f"{name} is defined as {ast.unparse(value)!r}")
+        for name, expected_expression in EXPECTED_DERIVED_ENV_DEFAULTS.items():
+            value = environment_assignments.get(name)
+            expected_value = ast.parse(expected_expression, mode="eval").body
+            if value is None or ast.dump(value, include_attributes=False) != ast.dump(
+                expected_value, include_attributes=False
+            ):
+                rendered = ast.unparse(value) if value is not None else None
+                failures.append(f"{name} is defined as {rendered!r}")
 
         defaults = _environment_defaults(config_source)
         if defaults != EXPECTED_ENV_DEFAULTS:
@@ -538,7 +557,11 @@ class PortabilityTest(unittest.TestCase):
         expected_loads = {
             "CHUNKFLOW_LIBERO_DATASET": 1,
             "CHUNKFLOW_REAL_DATA_DIR": 6,
-            "CHUNKFLOW_PI05_BASE_CHECKPOINT": 5,
+            "CHUNKFLOW_PI05_BASE_CHECKPOINT": 6,
+            "CHUNKFLOW_PAPER_REPO_ID": 2,
+            "CHUNKFLOW_PAPER_DATASET_ROOT": 2,
+            "CHUNKFLOW_SUPERVISED_CHECKPOINT": 2,
+            "CHUNKFLOW_SUPERVISED_ASSETS": 1,
             "CHUNKFLOW_REAL_JOINT_STAGE1_CHECKPOINT": 1,
             "CHUNKFLOW_REAL_JOINT_STAGE2_CHECKPOINT": 1,
         }
