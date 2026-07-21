@@ -8,6 +8,36 @@ from flax import struct
 import numpy as np
 
 
+def _require_real_floating(value: object, *, name: str) -> None:
+    array = np.asarray(value)
+    try:
+        floating = np.issubdtype(array.dtype, np.floating)
+    except TypeError:
+        floating = False
+    if not floating or not np.isrealobj(array):
+        raise ValueError(f"{name} must use a real floating dtype")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values")
+
+
+def _extract_executed_action(record: Mapping, key: str) -> np.ndarray:
+    if key not in record:
+        raise KeyError(f"missing required executed action field: {key}")
+    values = np.asarray(record[key])
+    if values.ndim == 1:
+        if values.shape[0] == 0:
+            raise ValueError(f"{key} executed action must be nonempty")
+        action = values
+    elif values.ndim == 2:
+        if values.shape[0] == 0 or values.shape[1] == 0:
+            raise ValueError(f"{key} executed action sequence must be nonempty")
+        action = values[0]
+    else:
+        raise ValueError(f"{key} executed action must have shape [A] or [T, A]")
+    _require_real_floating(action, name=f"{key} executed action")
+    return np.array(action, copy=True)
+
+
 @struct.dataclass
 class PairedChunkBatch:
     """Adjacent action chunks kept together through loading and shuffling."""
@@ -51,6 +81,9 @@ class PairedTransformedDataset:
         "discounts",
         "executed_actions",
     )
+    _OBSERVATION_EXCLUSIONS = frozenset(
+        {"actions", "executed_actions", "rewards", "discounts"}
+    )
 
     def __init__(
         self,
@@ -61,6 +94,7 @@ class PairedTransformedDataset:
         stride: int,
         history_length: int,
         action_horizon: int | None = None,
+        executed_action_key: str | None = None,
         pre_transforms: Sequence[Callable[[Mapping], Mapping]] = (),
         transforms: Sequence[Callable[[Mapping], Mapping]] = (),
     ):
@@ -87,6 +121,7 @@ class PairedTransformedDataset:
         self._record_lookup = {key: index for index, key in enumerate(self._record_keys)}
         self._stride = stride
         self._history_length = history_length
+        self._executed_action_key = executed_action_key
         self._pre_transforms = tuple(pre_transforms)
         self._transforms = tuple(transforms)
 
@@ -100,6 +135,8 @@ class PairedTransformedDataset:
         current_raw = copy.deepcopy(self._dataset[current_index])
         previous_optional = {key: previous_raw[key] for key in self._OPTIONAL_FIELDS if key in previous_raw}
         current_optional = {key: current_raw[key] for key in self._OPTIONAL_FIELDS if key in current_raw}
+        previous_configured_action = self._configured_history_action(previous_raw)
+        current_configured_action = self._configured_history_action(current_raw)
         previous = dict(self._apply(previous_raw, self._pre_transforms))
         current = dict(self._apply(current_raw, self._pre_transforms))
         previous.update(previous_optional)
@@ -113,20 +150,50 @@ class PairedTransformedDataset:
             raise ValueError("paired previous/current actions must have identical shape [horizon, action_dim]")
         if previous_actions_for_history.dtype != current_actions_for_history.dtype:
             raise ValueError("paired previous/current actions must have identical dtype")
+        previous_history_action = self._history_action(
+            previous_actions_for_history,
+            configured_action=previous_configured_action,
+            name="paired previous",
+        )
+        current_history_action = self._history_action(
+            current_actions_for_history,
+            configured_action=current_configured_action,
+            name="paired current",
+        )
+        if previous_history_action.shape != current_history_action.shape:
+            raise ValueError("paired previous/current executed actions must have identical shape")
+        if previous_history_action.dtype != current_history_action.dtype:
+            raise ValueError("paired previous/current executed actions must have identical dtype")
         action_cache = {
-            self._record_keys[previous_index]: previous_actions_for_history.copy(),
-            self._record_keys[current_index]: current_actions_for_history.copy(),
+            self._record_keys[previous_index]: (
+                previous_actions_for_history.copy(),
+                previous_history_action.copy(),
+            ),
+            self._record_keys[current_index]: (
+                current_actions_for_history.copy(),
+                current_history_action.copy(),
+            ),
         }
         previous_history, previous_history_mask = self._history_before(
-            previous_index, previous_actions_for_history, action_cache
+            previous_index,
+            previous_actions_for_history,
+            previous_history_action,
+            action_cache,
         )
         current_history, current_history_mask = self._history_before(
-            current_index, current_actions_for_history, action_cache
+            current_index,
+            current_actions_for_history,
+            current_history_action,
+            action_cache,
         )
         previous = dict(previous)
+        if self._executed_action_key == "executed_actions":
+            previous["executed_actions"] = previous_history_action[None].copy()
         previous["action_history"] = previous_history
         previous["action_history_mask"] = previous_history_mask
         current = dict(current)
+        if self._executed_action_key == "executed_actions":
+            current["executed_actions"] = current_history_action[None].copy()
         current["action_history"] = current_history
         current["action_history_mask"] = current_history_mask
 
@@ -153,11 +220,15 @@ class PairedTransformedDataset:
             data = transform(data)
         return data
 
-    @staticmethod
-    def _split_actions(data: Mapping) -> tuple[dict, object]:
+    @classmethod
+    def _split_actions(cls, data: Mapping) -> tuple[dict, object]:
         if "actions" not in data:
             raise KeyError("transformed paired records must contain actions")
-        return {key: value for key, value in data.items() if key != "actions"}, data["actions"]
+        return {
+            key: value
+            for key, value in data.items()
+            if key not in cls._OBSERVATION_EXCLUSIONS
+        }, data["actions"]
 
     def _validate_pair_actions(self, actions: object) -> np.ndarray:
         actions = np.asarray(actions)
@@ -169,13 +240,42 @@ class PairedTransformedDataset:
             raise ValueError("stride must not exceed the paired record action horizon")
         return actions
 
+    def _configured_history_action(self, raw: Mapping) -> np.ndarray | None:
+        if self._executed_action_key is None:
+            return None
+        return _extract_executed_action(raw, self._executed_action_key)
+
+    def _history_action(
+        self,
+        paired_actions: np.ndarray,
+        *,
+        configured_action: np.ndarray | None,
+        name: str,
+    ) -> np.ndarray:
+        if configured_action is None:
+            return np.array(paired_actions[0], copy=True)
+
+        if configured_action.shape != paired_actions.shape[1:]:
+            raise ValueError(
+                f"{name} configured executed action must match paired action shape [action_dim]"
+            )
+        if configured_action.dtype != paired_actions.dtype:
+            raise ValueError(
+                f"{name} configured executed action must match paired action dtype"
+            )
+        return configured_action
+
     def _history_before(
         self,
         record_index: int,
-        actions: np.ndarray,
-        action_cache: dict[tuple[int, int], np.ndarray],
+        paired_actions: np.ndarray,
+        history_action: np.ndarray,
+        action_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]],
     ) -> tuple[np.ndarray, np.ndarray]:
-        history = np.zeros((self._history_length, actions.shape[-1]), dtype=actions.dtype)
+        history = np.zeros(
+            (self._history_length, history_action.shape[-1]),
+            dtype=history_action.dtype,
+        )
         history_mask = np.zeros((self._history_length,), dtype=bool)
         episode, frame = self._record_keys[record_index]
         for position in range(self._history_length):
@@ -184,18 +284,34 @@ class PairedTransformedDataset:
             source_index = self._record_lookup.get(source_key)
             if source_index is None:
                 continue
-            source_actions = action_cache.get(source_key)
-            if source_actions is None:
-                source = self._apply(copy.deepcopy(self._dataset[source_index]), self._pre_transforms)
+            cached_source = action_cache.get(source_key)
+            if cached_source is None:
+                source_raw = copy.deepcopy(self._dataset[source_index])
+                source_configured_action = self._configured_history_action(source_raw)
+                source = self._apply(source_raw, self._pre_transforms)
                 if "actions" not in source:
                     raise KeyError("history source record must contain actions after pre_transforms")
-                source_actions = np.asarray(source["actions"]).copy()
-                action_cache[source_key] = source_actions
-            if source_actions.ndim != 2 or source_actions.shape != actions.shape:
+                source_actions = self._validate_pair_actions(source["actions"])
+                source_history_action = self._history_action(
+                    source_actions,
+                    configured_action=source_configured_action,
+                    name="history source",
+                )
+                cached_source = (
+                    source_actions.copy(),
+                    source_history_action.copy(),
+                )
+                action_cache[source_key] = cached_source
+            source_actions, source_history_action = cached_source
+            if source_actions.ndim != 2 or source_actions.shape != paired_actions.shape:
                 raise ValueError("history source actions must match the paired action shape [horizon, action_dim]")
-            if source_actions.dtype != actions.dtype:
+            if source_actions.dtype != paired_actions.dtype:
                 raise ValueError("history source actions must match the paired action dtype")
-            history[position] = source_actions[0]
+            if source_history_action.shape != history_action.shape:
+                raise ValueError("history source executed action shape must match the paired history action shape")
+            if source_history_action.dtype != history_action.dtype:
+                raise ValueError("history source executed action dtype must match the paired history action dtype")
+            history[position] = source_history_action
             history_mask[position] = True
         return history, history_mask
 
@@ -317,23 +433,7 @@ class StepTransitionDataset:
         }
 
     def _executed_action(self, record: Mapping) -> np.ndarray:
-        if self._executed_action_key not in record:
-            raise KeyError(f"missing required executed action field: {self._executed_action_key}")
-        values = np.asarray(record[self._executed_action_key])
-        if values.ndim == 1:
-            if values.shape[0] == 0:
-                raise ValueError(f"{self._executed_action_key} executed action must be nonempty")
-            action = values
-        elif values.ndim == 2:
-            if values.shape[0] == 0 or values.shape[1] == 0:
-                raise ValueError(f"{self._executed_action_key} executed action sequence must be nonempty")
-            action = values[0]
-        else:
-            raise ValueError(
-                f"{self._executed_action_key} executed action must have shape [A] or [T, A]"
-            )
-        self._require_real_floating(action, name=f"{self._executed_action_key} executed action")
-        return np.array(action, copy=True)
+        return _extract_executed_action(record, self._executed_action_key)
 
     @staticmethod
     def _scalar(record: Mapping, key: str):
@@ -441,15 +541,7 @@ class StepTransitionDataset:
 
     @staticmethod
     def _require_real_floating(value: object, *, name: str) -> None:
-        array = np.asarray(value)
-        try:
-            floating = np.issubdtype(array.dtype, np.floating)
-        except TypeError:
-            floating = False
-        if not floating or not np.isrealobj(array):
-            raise ValueError(f"{name} must use a real floating dtype")
-        if not np.all(np.isfinite(array)):
-            raise ValueError(f"{name} must contain only finite values")
+        _require_real_floating(value, name=name)
 
     @classmethod
     def _require_floating_leaves_finite(cls, tree: object) -> None:

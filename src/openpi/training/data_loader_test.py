@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from openpi.models import pi0_config
+from openpi.training import chunkflow_awac_train as _chunkflow_awac_train
 from openpi.training import chunkflow_batch
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
@@ -157,6 +158,107 @@ def test_awac_loader_returns_composite_batch_with_independent_streams():
     assert batch.transition.reward.shape == (2,)
 
 
+def test_map_style_awac_loader_excludes_transition_only_fields_before_train_validation(monkeypatch):
+    model_config = pi0_config.Pi0Config(
+        action_dim=4,
+        action_horizon=4,
+        overlap_O=2,
+        history_length=2,
+        awac_enable=True,
+    )
+
+    class _ScalarAwacFakeDataset(_data_loader.FakeDataset):
+        def __getitem__(self, index):
+            item = super().__getitem__(index)
+            item["executed_actions"] = np.array(item["actions"][:1], copy=True)
+            item["rewards"] = np.array([index == 7], dtype=np.float32)
+            item["discounts"] = np.array([index < 7], dtype=np.float32)
+            return item
+
+    raw_dataset = _ScalarAwacFakeDataset(model_config, num_samples=8)
+    monkeypatch.setattr(
+        _data_loader,
+        "create_torch_dataset",
+        lambda *args, **kwargs: raw_dataset,
+    )
+    loader = _data_loader.create_torch_data_loader(
+        _config.DataConfig(
+            repo_id="fake",
+            awac_executed_action_key="executed_actions",
+            awac_reward_key="rewards",
+            awac_continuation_key="discounts",
+        ),
+        model_config=model_config,
+        action_horizon=4,
+        batch_size=2,
+        num_batches=1,
+        skip_norm_stats=True,
+    )
+
+    batch = next(iter(loader))
+
+    _chunkflow_awac_train._validate_awac_batch(  # noqa: SLF001
+        batch,
+        action_dim=4,
+        action_horizon=4,
+        history_length=2,
+    )
+    for observation in (
+        batch.supervised.previous_observation,
+        batch.supervised.observation,
+    ):
+        assert observation.rewards is None
+        assert observation.discounts is None
+        assert observation.executed_actions is None
+
+
+def test_map_style_awac_loader_uses_configured_executed_actions_for_supervised_history(monkeypatch):
+    model_config = pi0_config.Pi0Config(
+        action_dim=4,
+        action_horizon=4,
+        overlap_O=2,
+        history_length=2,
+        awac_enable=True,
+    )
+
+    class _DistinctExecutedFakeDataset(_data_loader.FakeDataset):
+        def __getitem__(self, index):
+            item = super().__getitem__(index)
+            item["executed_actions"] = np.full(
+                (1, 4),
+                100.0 + index,
+                dtype=np.float32,
+            )
+            return item
+
+    raw_dataset = _DistinctExecutedFakeDataset(model_config, num_samples=8)
+    monkeypatch.setattr(
+        _data_loader,
+        "create_torch_dataset",
+        lambda *args, **kwargs: raw_dataset,
+    )
+    loader = _data_loader.create_torch_data_loader(
+        _config.DataConfig(
+            repo_id="fake",
+            awac_executed_action_key="executed_actions",
+            awac_reward_key="rewards",
+            awac_continuation_key="discounts",
+        ),
+        model_config=model_config,
+        action_horizon=4,
+        batch_size=2,
+        num_batches=1,
+        skip_norm_stats=True,
+    )
+
+    batch = next(iter(loader))
+
+    np.testing.assert_array_equal(
+        np.asarray(batch.supervised.observation.action_history[0]),
+        np.array([[100.0] * 4, [101.0] * 4], dtype=np.float32),
+    )
+
+
 @pytest.mark.parametrize(
     "missing",
     [
@@ -165,7 +267,7 @@ def test_awac_loader_returns_composite_batch_with_independent_streams():
         "awac_continuation_key",
     ],
 )
-def test_composite_loader_rejects_missing_awac_data_key_early_and_specifically(missing):
+def test_composite_loader_rejects_missing_awac_data_key_early_and_specifically(missing, monkeypatch):
     keys = {
         "awac_executed_action_key": "executed_actions",
         "awac_reward_key": "rewards",
@@ -174,6 +276,12 @@ def test_composite_loader_rejects_missing_awac_data_key_early_and_specifically(m
     keys[missing] = None
     data_config = _config.DataConfig(repo_id="fake", **keys)
     model_config = pi0_config.Pi0Config(action_horizon=4, overlap_O=2, awac_enable=True)
+
+    def fail_dataset_construction(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("AWAC key validation must run before dataset construction")
+
+    monkeypatch.setattr(_data_loader, "create_torch_dataset", fail_dataset_construction)
 
     with pytest.raises(ValueError, match=missing):
         _data_loader.create_torch_data_loader(
@@ -389,12 +497,18 @@ class _SingleBatchedPairDataset:
             "previous": {
                 "raw_state": np.array([[7.0]], dtype=np.float32),
                 "raw_actions": np.array([[[8.0], [9.0], [11.0]]], dtype=np.float32),
+                "rewards": np.array([[0.0]], dtype=np.float32),
+                "discounts": np.array([[1.0]], dtype=np.float32),
+                "executed_actions": np.array([[[8.5]]], dtype=np.float32),
             },
             "current": {
                 "raw_state": np.array([[8.0]], dtype=np.float32),
                 "raw_actions": np.array([[[10.0], [12.0], [14.0]]], dtype=np.float32),
                 "action_history": np.array([[[9.0], [11.0]]], dtype=np.float32),
                 "action_history_mask": np.array([[True, True]]),
+                "rewards": np.array([[1.0]], dtype=np.float32),
+                "discounts": np.array([[0.0]], dtype=np.float32),
+                "executed_actions": np.array([[[10.5]]], dtype=np.float32),
             },
         }
 
@@ -403,12 +517,23 @@ class _SingleBatchedPairDataset:
 
 
 def test_iterable_paired_transform_preserves_raw_history_across_repacking():
+    captured_optional_fields = []
+
+    def capture_optional_fields(data):
+        captured_optional_fields.append(
+            {
+                key: np.array(data[key], copy=True)
+                for key in ("rewards", "discounts", "executed_actions")
+            }
+        )
+        return data
+
     dataset = _data_loader.IterablePairedTransformedDataset(
         _SingleBatchedPairDataset(),
         pre_transforms=[
             _transforms.RepackTransform({"state": "raw_state", "actions": "raw_actions"})
         ],
-        transforms=[_transforms.DeltaActions(mask=[True])],
+        transforms=[_transforms.DeltaActions(mask=[True]), capture_optional_fields],
         is_batched=True,
     )
 
@@ -418,6 +543,10 @@ def test_iterable_paired_transform_preserves_raw_history_across_repacking():
     np.testing.assert_array_equal(batch["observation"]["action_history_mask"], [[True, True]])
     np.testing.assert_array_equal(batch["actions"], [[[2.0], [4.0], [6.0]]])
     np.testing.assert_array_equal(batch["previous_actions"], [[[1.0], [2.0], [4.0]]])
+    assert len(captured_optional_fields) == 2
+    for observation_name in ("previous_observation", "observation"):
+        for key in ("rewards", "discounts", "executed_actions"):
+            assert key not in batch[observation_name]
 
 
 def test_rlds_loader_enables_episode_pairing_only_for_capable_dataset(monkeypatch):

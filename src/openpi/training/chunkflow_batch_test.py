@@ -619,6 +619,186 @@ def test_step_transition_pretransforms_canonicalize_without_mutating_source_reco
             assert records[0][key] == value
 
 
+def _paired_history_records():
+    records = []
+    for frame in range(5):
+        executed = np.array([100.0 + frame], dtype=np.float32)
+        if frame % 2 == 0:
+            executed = np.stack((executed, executed + 100.0))
+        records.append(
+            {
+                "state": np.array([float(frame)], dtype=np.float32),
+                "actions": np.arange(
+                    10.0 + frame,
+                    14.0 + frame,
+                    dtype=np.float32,
+                )[:, None],
+                "executed": executed,
+            }
+        )
+    return records
+
+
+def test_paired_dataset_uses_configured_executed_history_before_action_transforms():
+    dataset = PairedTransformedDataset(
+        _ListDataset(_paired_history_records()),
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        stride=2,
+        history_length=2,
+        executed_action_key="executed",
+        transforms=[_transforms.DeltaActions(mask=[True])],
+    )
+
+    item = dataset[0]
+
+    np.testing.assert_array_equal(
+        item["observation"]["action_history"],
+        [[98.0], [99.0]],
+    )
+    np.testing.assert_array_equal(
+        item["observation"]["action_history_mask"],
+        [True, True],
+    )
+
+
+def test_paired_dataset_reads_configured_executed_history_before_mutating_pretransform():
+    def remove_executed_in_place(data):
+        data.pop("executed")
+        return data
+
+    dataset = PairedTransformedDataset(
+        _ListDataset(_paired_history_records()),
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        stride=2,
+        history_length=2,
+        executed_action_key="executed",
+        pre_transforms=[remove_executed_in_place],
+    )
+
+    item = dataset[0]
+
+    np.testing.assert_array_equal(
+        item["observation"]["action_history"],
+        [[100.0], [101.0]],
+    )
+
+
+def test_paired_dataset_accepts_vector_canonical_executed_actions_through_transforms():
+    records = _paired_history_records()
+    for record in records:
+        executed = np.asarray(record.pop("executed"))
+        record["executed_actions"] = executed[0] if executed.ndim == 2 else executed
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        stride=2,
+        history_length=2,
+        executed_action_key="executed_actions",
+        transforms=[_transforms.DeltaActions(mask=[True])],
+    )
+
+    item = dataset[0]
+
+    np.testing.assert_array_equal(
+        item["observation"]["action_history"],
+        [[98.0], [99.0]],
+    )
+
+
+def test_paired_dataset_legacy_none_uses_planned_action_history():
+    dataset = PairedTransformedDataset(
+        _ListDataset(_paired_history_records()),
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        stride=2,
+        history_length=2,
+        executed_action_key=None,
+    )
+
+    item = dataset[0]
+
+    np.testing.assert_array_equal(
+        item["observation"]["action_history"],
+        [[10.0], [11.0]],
+    )
+
+
+def test_paired_dataset_rejects_missing_configured_executed_action():
+    records = _paired_history_records()
+    records[0].pop("executed")
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        stride=2,
+        history_length=2,
+        executed_action_key="executed",
+    )
+
+    with pytest.raises(KeyError, match="executed"):
+        dataset[0]
+
+
+@pytest.mark.parametrize(
+    "executed",
+    [
+        np.array([], dtype=np.float32),
+        np.empty((0, 1), dtype=np.float32),
+        np.array(1.0, dtype=np.float32),
+        np.zeros((1, 1, 1), dtype=np.float32),
+        np.array([np.nan], dtype=np.float32),
+        np.array([1.0 + 1.0j]),
+        np.array([1], dtype=np.int32),
+    ],
+)
+def test_paired_dataset_rejects_malformed_configured_executed_action(executed):
+    records = _paired_history_records()
+    records[0]["executed"] = executed
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        stride=2,
+        history_length=2,
+        executed_action_key="executed",
+    )
+
+    with pytest.raises(ValueError, match="executed"):
+        dataset[0]
+
+
+@pytest.mark.parametrize(
+    ("record_index", "executed", "message"),
+    [
+        (2, np.array([102.0, 103.0], dtype=np.float32), r"paired.*shape"),
+        (2, np.array([102.0], dtype=np.float64), r"paired.*dtype"),
+        (1, np.array([101.0, 102.0], dtype=np.float32), r"history.*shape"),
+        (1, np.array([101.0], dtype=np.float64), r"history.*dtype"),
+    ],
+)
+def test_paired_dataset_rejects_inconsistent_configured_executed_history(
+    record_index,
+    executed,
+    message,
+):
+    records = _paired_history_records()
+    records[record_index]["executed"] = executed
+    dataset = PairedTransformedDataset(
+        _ListDataset(records),
+        episode_ids=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5),
+        stride=2,
+        history_length=2,
+        executed_action_key="executed",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        dataset[0]
+
+
 def test_paired_transformed_dataset_attaches_raw_history_before_action_transforms():
     records = [
         {
@@ -906,6 +1086,17 @@ def test_map_style_pairing_restores_optional_fields_after_repacking():
             "executed_actions": np.array([[4.0], [5.0]]),
         },
     ]
+    captured = []
+
+    def capture_optional_fields(data):
+        captured.append(
+            {
+                key: np.array(data[key], copy=True)
+                for key in ("rewards", "discounts", "executed_actions")
+            }
+        )
+        return data
+
     dataset = PairedTransformedDataset(
         _ListDataset(records),
         episode_ids=np.array([0, 0]),
@@ -913,10 +1104,14 @@ def test_map_style_pairing_restores_optional_fields_after_repacking():
         stride=2,
         history_length=1,
         pre_transforms=[_transforms.RepackTransform({"state": "raw_state", "actions": "raw_actions"})],
+        transforms=[capture_optional_fields],
     )
 
     item = dataset[0]
 
-    for key in ("rewards", "discounts", "executed_actions"):
-        np.testing.assert_array_equal(item["previous_observation"][key], records[0][key])
-        np.testing.assert_array_equal(item["observation"][key], records[1][key])
+    assert len(captured) == 2
+    for captured_record, source_record in zip(captured, records, strict=True):
+        for key in ("rewards", "discounts", "executed_actions"):
+            np.testing.assert_array_equal(captured_record[key], source_record[key])
+            assert key not in item["previous_observation"]
+            assert key not in item["observation"]

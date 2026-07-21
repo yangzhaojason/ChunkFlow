@@ -195,6 +195,9 @@ class IterablePairedTransformedDataset(IterableDataset[dict]):
         "discounts",
         "executed_actions",
     )
+    _OBSERVATION_EXCLUSIONS = frozenset(
+        {"actions", "executed_actions", "rewards", "discounts"}
+    )
 
     def __init__(
         self,
@@ -239,9 +242,17 @@ class IterablePairedTransformedDataset(IterableDataset[dict]):
             raise KeyError("transformed paired records must contain actions")
 
         return {
-            "previous_observation": {key: value for key, value in previous.items() if key != "actions"},
+            "previous_observation": {
+                key: value
+                for key, value in previous.items()
+                if key not in self._OBSERVATION_EXCLUSIONS
+            },
             "previous_actions": previous["actions"],
-            "observation": {key: value for key, value in current.items() if key != "actions"},
+            "observation": {
+                key: value
+                for key, value in current.items()
+                if key not in self._OBSERVATION_EXCLUSIONS
+            },
             "actions": current["actions"],
             "step": np.int32(0),
         }
@@ -725,6 +736,16 @@ def create_torch_data_loader(
     if framework == "pytorch" and bool(getattr(model_config, "awac_enable", False)):
         raise NotImplementedError("ChunkFlow AWAC training is supported only by the JAX trainer")
 
+    awac_enabled = bool(getattr(model_config, "awac_enable", False))
+    if awac_enabled:
+        for field_name in (
+            "awac_executed_action_key",
+            "awac_reward_key",
+            "awac_continuation_key",
+        ):
+            if getattr(data_config, field_name) is None:
+                raise ValueError(f"{field_name} must be configured when AWAC is enabled")
+
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
 
     def _build_torch_stream_loader(
@@ -766,7 +787,6 @@ def create_torch_data_loader(
         )
 
     training_enabled = bool(getattr(model_config, "chunkflow_training_enabled", False))
-    awac_enabled = bool(getattr(model_config, "awac_enable", False))
     if not training_enabled:
         legacy_dataset = transform_dataset(
             dataset, data_config, skip_norm_stats=skip_norm_stats
@@ -795,6 +815,11 @@ def create_torch_data_loader(
         stride=stride,
         history_length=history_length,
         action_horizon=action_horizon,
+        executed_action_key=(
+            typing.cast(str, data_config.awac_executed_action_key)
+            if awac_enabled
+            else None
+        ),
         pre_transforms=pre_transforms,
         transforms=transforms,
     )
@@ -809,14 +834,6 @@ def create_torch_data_loader(
 
     if not awac_enabled:
         return supervised_loader
-
-    for field_name in (
-        "awac_executed_action_key",
-        "awac_reward_key",
-        "awac_continuation_key",
-    ):
-        if getattr(data_config, field_name) is None:
-            raise ValueError(f"{field_name} must be configured when AWAC is enabled")
 
     transition_dataset = _chunkflow_batch.StepTransitionDataset(
         dataset,
