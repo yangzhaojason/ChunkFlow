@@ -220,14 +220,14 @@ class PairedTransformedDataset:
             data = transform(data)
         return data
 
-    @classmethod
-    def _split_actions(cls, data: Mapping) -> tuple[dict, object]:
+    def _split_actions(self, data: Mapping) -> tuple[dict, object]:
         if "actions" not in data:
             raise KeyError("transformed paired records must contain actions")
         return {
             key: value
             for key, value in data.items()
-            if key not in cls._OBSERVATION_EXCLUSIONS
+            if key not in self._OBSERVATION_EXCLUSIONS
+            and key != self._executed_action_key
         }, data["actions"]
 
     def _validate_pair_actions(self, actions: object) -> np.ndarray:

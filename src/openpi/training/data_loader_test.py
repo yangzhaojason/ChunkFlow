@@ -57,6 +57,54 @@ def test_torch_data_loader_parallel():
         assert all(x.shape[0] == 4 for x in jax.tree.leaves(batch))
 
 
+def test_torch_loader_collates_mixed_configured_executed_shapes_after_observation_filtering():
+    records = [
+        {
+            "state": np.array([float(frame)], dtype=np.float32),
+            "actions": np.arange(frame, frame + 2, dtype=np.float32)[:, None],
+            "custom_exec": executed,
+        }
+        for frame, executed in enumerate(
+            (
+                np.array([100.0], dtype=np.float32),
+                np.array([[101.0], [201.0]], dtype=np.float32),
+                np.array([102.0], dtype=np.float32),
+            )
+        )
+    ]
+
+    class _Records:
+        def __getitem__(self, index):
+            return records[index]
+
+        def __len__(self):
+            return len(records)
+
+    dataset = chunkflow_batch.PairedTransformedDataset(
+        _Records(),
+        episode_ids=np.zeros(3, dtype=np.int64),
+        frame_indices=np.arange(3),
+        stride=1,
+        history_length=1,
+        executed_action_key="custom_exec",
+    )
+    loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=2,
+        num_batches=1,
+        framework="pytorch",
+    )
+
+    batch = next(iter(loader))
+
+    assert "custom_exec" not in batch["previous_observation"]
+    assert "custom_exec" not in batch["observation"]
+    np.testing.assert_array_equal(
+        batch["observation"]["action_history"].numpy(),
+        np.array([[[100.0]], [[101.0]]], dtype=np.float32),
+    )
+
+
 def test_with_fake_dataset():
     config = _config.get_config("debug")
 

@@ -660,6 +660,8 @@ def test_paired_dataset_uses_configured_executed_history_before_action_transform
         item["observation"]["action_history_mask"],
         [True, True],
     )
+    for observation_name in ("previous_observation", "observation"):
+        assert "executed" not in item[observation_name]
 
 
 def test_paired_dataset_reads_configured_executed_history_before_mutating_pretransform():
@@ -724,6 +726,8 @@ def test_paired_dataset_legacy_none_uses_planned_action_history():
         item["observation"]["action_history"],
         [[10.0], [11.0]],
     )
+    assert "executed" in item["previous_observation"]
+    assert "executed" in item["observation"]
 
 
 def test_paired_dataset_rejects_missing_configured_executed_action():
