@@ -4,11 +4,17 @@ This example runs the LIBERO benchmark: https://github.com/Lifelong-Robot-Learni
 
 Note: When updating requirements.txt in this directory, there is an additional flag `--extra-index-url https://download.pytorch.org/whl/cu113` that must be added to the `uv pip compile` command.
 
-This example requires git submodules to be initialized. Don't forget to run:
+From the ChunkFlow repository root, fetch the external benchmark source before
+either Docker or local setup. Use the same revision as `pyproject.toml`:
 
 ```bash
-git submodule update --init --recursive
+mkdir -p third_party
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git third_party/libero
+git -C third_party/libero checkout f78abd68ee283de9f9be3c8f7e2a9ad60246e95c
 ```
+
+If the checkout already exists, skip `git clone`. The source is intentionally
+excluded from this repository; both setups below read `third_party/libero`.
 
 ## With Docker (recommended)
 

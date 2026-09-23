@@ -16,7 +16,7 @@ authors:
   - family-names: Liu
     given-names: Longjun
 repository-code: https://github.com/yangzhaojason/ChunkFlow
-url: https://cytoderm-ai.github.io/chunkflow/
+url: https://cytoderm-ai.github.io/
 license: Apache-2.0
 preferred-citation:
   type: conference-paper

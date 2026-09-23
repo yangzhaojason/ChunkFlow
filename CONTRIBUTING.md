@@ -12,9 +12,7 @@ rather than this derivative, may be better proposed to the upstream project.
 ## Before opening an issue
 
 Use [ChunkFlow Issues](https://github.com/yangzhaojason/ChunkFlow/issues) for
-reproducible defects and feature requests. Use
-[ChunkFlow Discussions](https://github.com/yangzhaojason/ChunkFlow/discussions)
-for usage questions and open-ended design topics.
+reproducible defects, feature requests, and usage questions.
 
 For a bug report, include:
 
@@ -31,11 +29,10 @@ other confidential artifacts.
 ## Development setup
 
 ```bash
-git clone git@github.com:yangzhaojason/ChunkFlow.git
+git clone https://github.com/yangzhaojason/ChunkFlow.git
 cd ChunkFlow
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
-uv run pre-commit install
 ```
 
 Create a focused branch, write a failing regression test before implementation,
@@ -47,15 +44,20 @@ Run the smallest relevant test while iterating, followed by the affected suite.
 For release-document changes, run:
 
 ```bash
-uv run pytest scripts/release_docs_test.py scripts/audit_release_test.py -q
+uv run pytest scripts/release_docs_test.py scripts/audit_release_test.py --confcutdir=scripts -q
+uv run pytest src/openpi/training/portability_test.py --confcutdir=src/openpi/training -q
 uv run python scripts/audit_release.py --root .
-uv run ruff check scripts/release_docs_test.py
+uv run ruff check scripts/release_docs_test.py scripts/audit_release.py scripts/audit_release_test.py
 git diff --check
 ```
 
 Model or data-pipeline changes should also run their colocated tests. Tests that
 need external datasets or accelerators must document those prerequisites and
 must not silently substitute private resources.
+
+The release audit checks Git-tracked and non-ignored files for local workflow
+artifacts, copied assistant instructions, private paths, credentials, symlinks,
+and oversized files. These checks also run on pushes and pull requests.
 
 ## Pull requests
 

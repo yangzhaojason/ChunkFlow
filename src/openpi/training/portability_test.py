@@ -289,7 +289,11 @@ def _package_stub(name: str) -> types.ModuleType:
 
 
 def _load_truth_dataset_module():
+    # Load NumPy before patch.dict restores sys.modules, avoiding repeated imports.
+    importlib.import_module("numpy")
     openpi = _package_stub("openpi")
+    # Keep pure local training helpers importable while replacing download I/O.
+    openpi.__path__ = [str(ROOT / "src/openpi")]
     shared = _package_stub("openpi.shared")
     download = types.ModuleType("openpi.shared.download")
     openpi.shared = shared
@@ -379,7 +383,7 @@ class PortabilityTest(unittest.TestCase):
             failures.append(f"project description is {project.get('description')!r}")
         expected_urls = {
             "Repository": "https://github.com/yangzhaojason/ChunkFlow",
-            "Project": "https://cytoderm-ai.github.io/chunkflow/",
+            "Project": "https://cytoderm-ai.github.io/",
         }
         if project.get("urls") != expected_urls:
             failures.append(f"project URLs are {project.get('urls')!r}")

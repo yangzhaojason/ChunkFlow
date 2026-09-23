@@ -57,7 +57,7 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/yangzhaojason/ChunkFlow"
-Project = "https://cytoderm-ai.github.io/chunkflow/"
+Project = "https://cytoderm-ai.github.io/"
 
 [dependency-groups]
 dev = [

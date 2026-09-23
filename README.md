@@ -4,7 +4,7 @@ ChunkFlow is the research implementation for **“ChunkFlow: Towards Continuity-
 accepted by the **IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS) 2026**.
 
 Authors: Zhao Yang, Yinan Shi, Mingyuan Yao, Wenyao Xue, Yawei Jueluo, and
-Longjun Liu. See the [project page](https://cytoderm-ai.github.io/chunkflow/)
+Longjun Liu. See the [project page](https://cytoderm-ai.github.io/)
 and the repository [citation metadata](CITATION.cff).
 
 ## Lineage and scope
@@ -57,7 +57,7 @@ setting up Python dependencies.
 ## Installation
 
 ```bash
-git clone git@github.com:yangzhaojason/ChunkFlow.git
+git clone https://github.com/yangzhaojason/ChunkFlow.git
 cd ChunkFlow
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .

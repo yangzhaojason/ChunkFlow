@@ -4,7 +4,19 @@ This example demonstrates how to run with a real robot using an [ALOHA setup](ht
 
 ## Prerequisites
 
-This repo uses a fork of the ALOHA repo, with very minor modifications to use Realsense cameras.
+This example uses [Physical Intelligence's ALOHA fork](https://github.com/Physical-Intelligence/aloha)
+with RealSense camera support. From the ChunkFlow repository root, fetch the
+revision used by upstream openpi before either Docker or local setup:
+
+```bash
+mkdir -p third_party
+git clone https://github.com/Physical-Intelligence/aloha.git third_party/aloha
+git -C third_party/aloha checkout d1dc83afd89ded4379851257fe5d85632d31d5ec
+```
+
+If the checkout already exists, skip `git clone`. This external source is not
+bundled with ChunkFlow. The Docker build copies it into the ROS workspace;
+for local setup, install it into your ROS workspace using the upstream instructions.
 
 1. Follow the [hardware installation instructions](https://github.com/tonyzhaozh/aloha?tab=readme-ov-file#hardware-installation) in the ALOHA repo.
 1. Modify the `third_party/aloha/aloha_scripts/realsense_publisher.py` file to use serial numbers for your cameras.

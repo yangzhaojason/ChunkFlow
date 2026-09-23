@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import subprocess
 from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +43,7 @@ def test_readme_identifies_chunkflow_paper_and_authors() -> None:
         "Longjun Liu",
     ):
         assert author in readme
-    assert "https://cytoderm-ai.github.io/chunkflow/" in readme
+    assert "https://cytoderm-ai.github.io/" in readme
 
 
 def test_readme_separates_chunkflow_from_upstream_openpi_authorship() -> None:
@@ -84,7 +85,7 @@ def test_readme_states_supported_method_contract_without_exact_density_claims() 
 def test_installation_uses_chunkflow_clone_without_submodule_commands() -> None:
     readme = _read("README.md")
 
-    assert "git clone git@github.com:yangzhaojason/ChunkFlow.git" in readme
+    assert "git clone https://github.com/yangzhaojason/ChunkFlow.git" in readme
     assert "git@github.com:Physical-Intelligence/openpi.git" not in readme
     assert "--recurse-submodules" not in readme
     assert "git submodule" not in readme
@@ -206,7 +207,8 @@ def test_readme_preserves_openpi_capability_navigation_and_backend_boundary() ->
 
 
 def test_owned_markdown_relative_links_resolve() -> None:
-    for relative_path in ("README.md", "CONTRIBUTING.md", "docs/paper_to_code.md"):
+    files = subprocess.check_output(["git", "ls-files", "-z", "*.md"], cwd=ROOT).decode().split("\0")
+    for relative_path in filter(None, files):
         source = ROOT / relative_path
         text = _read(relative_path)
         for raw_target in re.findall(r"!?\[[^\]]*\]\(([^)]+)\)", text):
@@ -223,7 +225,6 @@ def test_contributing_targets_chunkflow_repository_and_preserves_upstream_credit
 
     assert contributing.startswith("# Contributing to ChunkFlow\n")
     assert "https://github.com/yangzhaojason/ChunkFlow/issues" in contributing
-    assert "https://github.com/yangzhaojason/ChunkFlow/discussions" in contributing
     assert "Physical Intelligence" in contributing
     assert "https://github.com/Physical-Intelligence/openpi" in contributing
     assert "scripts/release_docs_test.py" in contributing
@@ -236,7 +237,7 @@ def test_citation_cff_has_software_and_conference_metadata_without_guesses() -> 
         "type: software",
         'title: "ChunkFlow"',
         "repository-code: https://github.com/yangzhaojason/ChunkFlow",
-        "url: https://cytoderm-ai.github.io/chunkflow/",
+        "url: https://cytoderm-ai.github.io/",
         "license: Apache-2.0",
         "preferred-citation:",
         "  type: conference-paper",

@@ -1,0 +1,38 @@
+name: Release checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install check dependencies
+        run: python -m pip install pytest numpy ruff==0.16.1
+      - name: Check release files and documentation
+        run: |
+          python scripts/audit_release.py --root .
+          python -m pytest scripts/audit_release_test.py scripts/release_docs_test.py --confcutdir=scripts -q
+          python -m pytest src/openpi/training/portability_test.py --confcutdir=src/openpi/training -q
+          python -m ruff check scripts/audit_release.py scripts/audit_release_test.py scripts/release_docs_test.py
+      - name: Check committed whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            git show --format= --check HEAD
+          else
+            git diff --check "$BASE_SHA" HEAD
+          fi

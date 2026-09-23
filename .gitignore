@@ -180,6 +180,17 @@ results/
 # Local paper-review and release-audit artifacts at the repository root
 /tmp/
 
+# Local development assistants and workflow notes
+.agents/
+.claude/
+.codex/
+.cursor/
+AGENTS.md
+CLAUDE.md
+.cursorrules
+.mcp.json
+docs/superpowers/
+
 # Model, dataset, and result artifacts
 *.avi
 *.bin

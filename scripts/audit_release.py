@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import stat
 import subprocess
-from typing import Sequence
-
 
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 
@@ -31,6 +31,17 @@ SECRET_PATTERNS = (
     re.compile(rb"\b(?:AK" rb"IA|AS" rb"IA)[A-Z0-9]{16}\b"),
     re.compile(rb"\bx" rb"ox(?:a|b|p|r|s)-[A-Za-z0-9-]{10,}\b"),
 )
+
+LOCAL_WORKFLOW_DIRS = frozenset({".agents", ".claude", ".codex", ".cursor"})
+LOCAL_WORKFLOW_FILES = frozenset({"AGENTS.md", "CLAUDE.md", ".cursorrules", ".mcp.json"})
+ASSISTANT_INSTRUCTION_PATTERN = re.compile(
+    r"^[ \t]*(?:[>#*][ \t]*)*"
+    r"(?:For agentic workers:|REQUIRED SUB-SKILL:|"
+    r"(?:Generated|Written|Created) (?:by|with) (?:Claude(?: Code)?|Codex|ChatGPT)\b|"
+    r"Co-authored-by:[ \t]*(?:Claude|Codex)\b)",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -62,6 +73,15 @@ def scan_file(
     decoded_contents = contents.decode("utf-8", errors="surrogateescape")
 
     findings = []
+    relative_path = PurePosixPath(display_name)
+    if (
+        LOCAL_WORKFLOW_DIRS.intersection(relative_path.parts[:-1])
+        or relative_path.name in LOCAL_WORKFLOW_FILES
+        or ("docs", "superpowers") in zip(relative_path.parts, relative_path.parts[1:], strict=False)
+    ):
+        findings.append(Finding("local-workflow-file", display_name))
+    if ASSISTANT_INSTRUCTION_PATTERN.search(decoded_contents):
+        findings.append(Finding("assistant-instruction", display_name))
     if any(pattern.search(decoded_contents) for pattern in INTERNAL_PATTERNS):
         findings.append(Finding("internal-path", display_name))
     if any(pattern.search(contents) for pattern in SECRET_PATTERNS):
@@ -76,8 +96,7 @@ def tracked_files(root: str | os.PathLike[str]) -> list[Path]:
             ["git", "ls-files", "-co", "--exclude-standard", "-z"],
             cwd=root_path,
             check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
     except OSError:
         raise RuntimeError(f"git file discovery failed for {root_path}") from None
